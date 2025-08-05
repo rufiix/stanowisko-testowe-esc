@@ -1,17 +1,17 @@
-# --- POCZĄTEK OSTATECZNEGO, POPRAWNEGO KODU ---
+# --- OSTATECZNA WERSJA 2.0 Z POPRAWIONYM PASKIEM POSTĘPU ---
 import time
 import random
 import threading
 import pigpio
 import sys
-from nicegui import ui, app  # <-- POPRAWKA 1: Dodano import 'app'
+from nicegui import ui, app
 
 # --- Konfiguracja Aplikacji ---
 GPIO_PIN_ESC = 18
 APP_PORT = 8081
 
 class ESCTestStand:
-    # ... (cała klasa ESCTestStand pozostaje bez zmian, jest poprawna) ...
+    # --- Ta klasa jest w pełni poprawna i pozostaje bez zmian ---
     def __init__(self, gpio_pin):
         self.gpio_pin = gpio_pin
         self.duration_minutes = 10
@@ -49,6 +49,14 @@ class ESCTestStand:
         if self._is_paused:
             return self._end_time - self._pause_time
         return self._end_time - time.time()
+
+    @property
+    def elapsed_time(self):
+        if not self._is_running:
+            return 0
+        if self._is_paused:
+            return self._pause_time - self._start_time
+        return time.time() - self._start_time
 
     @property
     def progress(self):
@@ -123,7 +131,6 @@ except Exception as e:
 
 @ui.page('/')
 def main_page():
-    # ... (cała definicja strony pozostaje bez zmian, jest poprawna) ...
     if pigpio_error:
         ui.label("BŁĄD KRYTYCZNY").classes("text-h4 text-negative text-center w-full")
         ui.html(f"<p>Nie udało się połączyć z biblioteką <b>pigpio</b>: <pre>{pigpio_error}</pre></p>").classes("text-body1 text-center w-full")
@@ -133,15 +140,38 @@ def main_page():
     ui.label('Stanowisko Testowe ESC').classes('text-h3 text-bold q-my-md text-center w-full')
     with ui.card().classes('w-full max-w-2xl mx-auto'):
         ui.label('Status na żywo').classes('text-h5')
+        
+        # Osobne etykiety na status i czas do końca
         ui.label().classes('text-xl').bind_text_from(stand, 'status_text', lambda s: f'Status: {s}')
         ui.label().classes('text-lg').bind_text_from(stand, 'time_left', lambda t: f"Czas do końca: {int(t//60):02d}:{int(t%60):02d}")
-        ui.label().classes('text-lg font-mono').bind_text_from(stand, '_current_pwm', lambda p: f"Aktualne PWM: {p:7.2f} µs")
-        ui.linear_progress().props('instant-feedback').bind_value_from(stand, 'progress')
+        
+        # Osobna etykieta na dokładną wartość PWM
+        ui.label().classes('text-lg font-mono').bind_text_from(stand, '_current_pwm', lambda p: f"Dokładne PWM: {p:7.2f} µs")
+
+        # Pasek postępu, który będzie zawierał swoją własną etykietę
+        with ui.linear_progress(show_value=False).bind_value_from(stand, 'progress').style('height: 35px; border-radius: 8px;').props('instant-feedback'):
+            # Tworzymy etykietę w środku, ale bez bindowania. Nadajemy jej nazwę.
+            progress_bar_label = ui.label().classes('absolute-center text-black text-bold text-h6')
+
+        # <<< POPRAWKA: Używamy timera do aktualizacji napisu na pasku >>>
+        def update_progress_bar_text():
+            """Funkcja wywoływana co 0.1s do odświeżania napisu na pasku."""
+            elapsed = stand.elapsed_time
+            text_to_show = (
+                f'{stand._current_pwm:.0f} µs | '
+                f'Czas: {int(elapsed // 60):02d}:{int(elapsed % 60):02d}'
+            )
+            progress_bar_label.set_text(text_to_show)
+        
+        # Uruchamiamy timer, który będzie wywoływał powyższą funkcję 10 razy na sekundę
+        ui.timer(0.1, update_progress_bar_text)
+
         ui.separator().classes('q-my-md')
         with ui.row().classes('w-full justify-around'):
             ui.button('Start', on_click=stand.start_test, color='positive').props('icon=play_arrow').bind_enabled_from(stand, 'is_running', backward=lambda x: not x)
             ui.button('Pauza/Wznów', on_click=stand.toggle_pause, color='warning').props('icon=pause').bind_enabled_from(stand, 'is_running')
             ui.button('Stop', on_click=stand.stop_test, color='negative').props('icon=stop').bind_enabled_from(stand, 'is_running')
+            
     with ui.card().classes('w-full max-w-2xl mx-auto q-mt-md'):
         ui.label('Ustawienia testu').classes('text-h5')
         with ui.grid(columns=2).classes('w-full gap-4'):
@@ -153,7 +183,6 @@ def main_page():
             ui.number(label='Rampa spadku (PWM/s)', min=1, max=1000000, step=100, value=800).bind_value(stand, 'ramp_down_per_s').bind_enabled_from(stand, *is_stopped)
 
 if stand:
-    # <-- POPRAWKA 2: Używamy 'app' zamiast 'ui'
     app.on_shutdown(stand.cleanup)
 
 ui.run(title='Stanowisko Testowe ESC', port=APP_PORT, host='0.0.0.0', show=False, reload=False)

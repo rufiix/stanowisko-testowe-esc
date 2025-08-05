@@ -1,4 +1,4 @@
-# --- OSTATECZNA, BEZPIECZNA WERSJA (ZAWSZE STARTUJE ROZBROJONY) ---
+# --- OSTATECZNA WERSJA - PAUZA ZAWSZE WRACA DO IDLE I WZNAWIA OD IDLE ---
 import time
 import random
 import threading
@@ -13,9 +13,7 @@ APP_PORT = 8081
 class ESCTestStand:
     def __init__(self, gpio_pin):
         self.gpio_pin = gpio_pin
-        # <<< ZMIANA: Stan początkowy jest na sztywno ustawiony jako ROZBROJONY >>>
         self._is_armed = False
-        
         self.idle_pwm = 1050
         self.duration_minutes = 10
         self.min_pwm = 1100
@@ -36,19 +34,35 @@ class ESCTestStand:
         if not self.pi.connected:
             raise IOError("Nie można połączyć się z demonem pigpio. Uruchom 'sudo pigpiod'.")
         self.pi.set_mode(self.gpio_pin, pigpio.OUTPUT)
-        # <<< ZMIANA: Zawsze startujemy z PWM ustawionym na 0 >>>
         self.pi.set_servo_pulsewidth(self.gpio_pin, 0)
         print("System uruchomiony w trybie ROZBROJONY (bezpieczny).")
 
-    # <<< ZMIANA: Usunięto metody _load_state_and_clear() oraz _save_state() >>>
+    # <<< ZMIANA: Uproszczono logikę pauzy i wznawiania >>>
+    def toggle_pause(self):
+        if not self._is_running: return
+        self._is_paused = not self._is_paused
+        
+        if self._is_paused:
+            # Aktywacja pauzy
+            self._pause_time = time.time()
+            # Ustaw sygnał na bezpieczną wartość IDLE
+            self._current_pwm = self.idle_pwm
+            self.pi.set_servo_pulsewidth(self.gpio_pin, self.idle_pwm)
+            ui.notify("Test SPAUZOWANY. Powrót do trybu IDLE.", type='info')
+        else:
+            # Wznowienie testu
+            # Po prostu korygujemy czas, pętla testowa sama ruszy od IDLE
+            pause_duration = time.time() - self._pause_time
+            self._end_time += pause_duration
+            ui.notify("Test WZNOWIONY.", type='info')
 
+    # --- Reszta kodu jest w pełni poprawna ---
     def arm_system(self):
         if self._is_armed: return
         self._is_armed = True
         self._current_pwm = self.idle_pwm
         self.pi.set_servo_pulsewidth(self.gpio_pin, self.idle_pwm)
         ui.notify("System UZBROJONY. Silnik w trybie IDLE.", type='warning')
-
     def disarm_system(self):
         if not self._is_armed: return
         if self._is_running:
@@ -58,15 +72,12 @@ class ESCTestStand:
         self._current_pwm = 0
         self.pi.set_servo_pulsewidth(self.gpio_pin, 0)
         ui.notify("System ROZBROJONY. Silnik wyłączony.", type='positive')
-
     def cleanup(self):
         print("Zatrzymywanie i sprzątanie zasobów ESC...")
         if hasattr(self, 'pi') and self.pi.connected:
             self.pi.set_servo_pulsewidth(self.gpio_pin, 0)
             self.pi.stop()
         print("Zasoby ESC zwolnione.")
-    
-    # ... reszta kodu (metody, UI) jest w pełni poprawna ...
     def update_idle_pwm(self):
         if self._is_armed and not self._is_running:
             self._current_pwm = self.idle_pwm
@@ -85,9 +96,9 @@ class ESCTestStand:
     @property
     def status_text(self):
         if not self._is_armed: return "ROZBROJONY (BEZPIECZNY)"
-        if not self._is_running: return f"UZBROJONY / IDLE ({self.idle_pwm} µs)"
-        if self._is_paused: return "Spauzowany"
-        return "Uruchomiony"
+        if self._is_running and self._is_paused: return "SPAUZOWANY (w trybie IDLE)"
+        if self._is_running: return "Uruchomiony"
+        return f"UZBROJONY / IDLE ({self.idle_pwm} µs)"
     @property
     def time_left(self):
         if not self._is_running: return self.duration_minutes * 60
@@ -95,9 +106,9 @@ class ESCTestStand:
         return self._end_time - time.time()
     @property
     def elapsed_time(self):
-        if not self._is_running or self._start_time == 0: return 0
-        if self._is_paused: return self._pause_time - self._start_time
-        return time.time() - self._start_time
+        if not self._is_running: return 0
+        if self._is_paused: return self._pause_time - self._start_time if self._start_time > 0 else 0
+        return time.time() - self._start_time if self._start_time > 0 else 0
     @property
     def progress(self):
         total_duration = self.duration_minutes * 60
@@ -110,16 +121,6 @@ class ESCTestStand:
         self._test_thread = threading.Thread(target=self._run_test_loop, daemon=True)
         self._test_thread.start()
         ui.notify("Test ESC rozpoczęty!", type='positive')
-    def toggle_pause(self):
-        if not self._is_running: return
-        self._is_paused = not self._is_paused
-        if self._is_paused:
-            self._pause_time = time.time()
-            ui.notify("Test ESC spauzowany.", type='info')
-        else:
-            pause_duration = time.time() - self._pause_time
-            self._end_time += pause_duration
-            ui.notify("Test ESC wznowiony.", type='info')
     def _run_test_loop(self):
         self._start_time = time.time()
         self._end_time = self._start_time + self.duration_minutes * 60
@@ -184,28 +185,21 @@ def main_page():
     with ui.card().classes('w-full max-w-2xl mx-auto q-mt-md'):
         ui.label('Ustawienia').classes('text-h5')
         with ui.grid(columns=2).classes('w-full gap-4'):
-            # Pole IDLE można edytować tylko w stanie rozbrojonym.
             ui.number(label='IDLE PWM (µs)', min=800, max=1200, step=1, value=1050) \
                 .bind_value(stand, 'idle_pwm') \
                 .bind_enabled_from(stand, 'is_armed', backward=lambda armed: not armed)
-            
-            # Pozostałe pola są zablokowane TYLKO, gdy test jest faktycznie uruchomiony.
             ui.number(label='Czas trwania (min)', min=1, max=1440, step=1, value=10) \
                 .bind_value(stand, 'duration_minutes') \
                 .bind_enabled_from(stand, 'is_running', backward=lambda running: not running)
-            
             ui.number(label='Min. PWM w teście (µs)', min=900, max=2500, step=10, value=1100) \
                 .bind_value(stand, 'min_pwm') \
                 .bind_enabled_from(stand, 'is_running', backward=lambda running: not running)
-
             ui.number(label='Max. PWM w teście (µs)', min=900, max=2500, step=10, value=2000) \
                 .bind_value(stand, 'max_pwm') \
                 .bind_enabled_from(stand, 'is_running', backward=lambda running: not running)
-
             ui.number(label='Rampa wzrostu (PWM/s)', min=1, max=1000000, step=100, value=500) \
                 .bind_value(stand, 'ramp_up_per_s') \
                 .bind_enabled_from(stand, 'is_running', backward=lambda running: not running)
-            
             ui.number(label='Rampa spadku (PWM/s)', min=1, max=1000000, step=100, value=800) \
                 .bind_value(stand, 'ramp_down_per_s') \
                 .bind_enabled_from(stand, 'is_running', backward=lambda running: not running)

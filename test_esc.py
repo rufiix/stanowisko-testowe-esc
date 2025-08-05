@@ -1,4 +1,4 @@
-# --- OSTATECZNA WERSJA 16.0 - POPRAWIONA ARCHITEKTURA I LOGIKA UZBRAJANIA ---
+# --- OSTATECZNA WERSJA 16.0 - USUNIĘTO OSTATNI BŁĄD SKŁADNI ---
 import time
 import random
 import threading
@@ -13,15 +13,19 @@ APP_PORT = 8081
 class ESCTestStand:
     def __init__(self, gpio_pin):
         self.gpio_pin = gpio_pin
+        # Stany i parametry
         self._is_armed = False
         self._is_running = False
         self._is_paused = False
+        self._stop_thread = False
+        # Parametry
         self.idle_pwm = 1050
         self.duration_minutes = 10
         self.min_pwm = 1100
         self.max_pwm = 2000
         self.ramp_up_per_s = 500
         self.ramp_down_per_s = 800
+        # Zmienne wewnętrzne
         self._current_pwm = 0
         self._target_pwm = 0
         self._start_time = 0
@@ -40,10 +44,7 @@ class ESCTestStand:
 
     def _run_pwm_loop(self):
         """Jedna pętla do zarządzania wszystkimi stanami sygnału PWM."""
-        while True:
-            # --- Logika maszyny stanów ---
-            
-            # STAN 1: Test jest aktywnie uruchomiony (nie spauzowany)
+        while not self._stop_thread:
             if self._is_running and not self._is_paused:
                 current_time = time.time()
                 dt = current_time - self._last_update_time
@@ -54,23 +55,33 @@ class ESCTestStand:
                     self._current_pwm = min(self._current_pwm + self.ramp_up_per_s * dt, self._target_pwm)
                 elif self._current_pwm > self._target_pwm:
                     self._current_pwm = max(self._current_pwm - self.ramp_down_per_s * dt, self._target_pwm)
-            
-            # STAN 2: System jest uzbrojony, ale test nie jest aktywny (IDLE lub Pauza)
             elif self._is_armed:
                 self._current_pwm = self.idle_pwm
-            
-            # STAN 3: System jest rozbrojony
             else:
                 self._current_pwm = 0
             
-            self.pi.set_servo_pulsewidth(self.gpio_pin, int(self._current_pwm))
+            try:
+                self.pi.set_servo_pulsewidth(self.gpio_pin, int(self._current_pwm))
+            except Exception:
+                pass
+            
             time.sleep(0.02)
+        print("Pętla PWM zakończona.")
 
-    # <<< POPRAWKA: Funkcje sterujące NATYCHMIAST zmieniają stan _current_pwm >>>
+    def cleanup(self):
+        print("Rozpoczynanie procedury zamykania...")
+        self._stop_thread = True
+        if self._pwm_loop_thread:
+            self._pwm_loop_thread.join(timeout=0.2)
+        print("Zatrzymywanie i sprzątanie zasobów ESC...")
+        if hasattr(self, 'pi') and self.pi.connected:
+            self.pi.set_servo_pulsewidth(self.gpio_pin, 0)
+            self.pi.stop()
+        print("Zasoby ESC zwolnione.")
+
     def arm_system(self):
         if self._is_armed: return
         self._is_armed = True
-        self._current_pwm = self.idle_pwm # Natychmiastowa zmiana wartości
         ui.notify("System UZBROJONY.", type='warning')
         
     def disarm_system(self):
@@ -78,36 +89,35 @@ class ESCTestStand:
         if self._is_running:
             self.stop_test()
         self._is_armed = False
-        self._current_pwm = 0 # Natychmiastowa zmiana wartości
         ui.notify("System ROZBROJONY.", type='positive')
+
+    def start_test(self):
+        if self._is_running or not self._is_armed: return
+        self._start_time = time.time()
+        self._end_time = self._start_time + self.duration_minutes * 60
+        self._last_update_time = self._start_time
+        self._target_pwm = random.uniform(self.min_pwm, self.max_pwm)
+        self._is_paused = False
+        self._is_running = True
+        ui.notify("Test ESC rozpoczęty!", type='positive')
 
     def stop_test(self):
         if not self._is_running: return
         self._is_running = False
-        self._current_pwm = self.idle_pwm # Natychmiastowa zmiana wartości
         ui.notify("Test zatrzymany. Powrót do trybu IDLE.")
-        
+
     def toggle_pause(self):
         if not self._is_running: return
         self._is_paused = not self._is_paused
         if self._is_paused:
             self._pause_time = time.time()
-            self._current_pwm = self.idle_pwm # Natychmiastowa zmiana wartości
             ui.notify("Test SPAUZOWANY.", type='info')
         else:
             pause_duration = time.time() - self._pause_time
             self._end_time += pause_duration
             self._last_update_time = time.time()
-            # Po wznowieniu pętla sama ruszy od IDLE w kierunku celu
             ui.notify("Test WZNOWIONY.", type='info')
 
-    # --- Reszta metod i UI jest poprawna ---
-    def cleanup(self):
-        print("Zatrzymywanie i sprzątanie zasobów ESC...")
-        if hasattr(self, 'pi') and self.pi.connected:
-            self.pi.set_servo_pulsewidth(self.gpio_pin, 0)
-            self.pi.stop()
-        print("Zasoby ESC zwolnione.")
     @property
     def is_armed(self): return self._is_armed
     @property
@@ -137,17 +147,6 @@ class ESCTestStand:
         if total_duration == 0 or not self._is_running: return 0
         time_left = self.time_left
         return (total_duration - max(0, time_left)) / total_duration
-    def start_test(self):
-        if self._is_running or not self._is_armed: return
-        self._start_time = time.time()
-        self._end_time = self._start_time + self.duration_minutes * 60
-        self._last_update_time = self._start_time
-        self._target_pwm = random.uniform(self.min_pwm, self.max_pwm)
-        self._is_paused = False
-        self._is_running = True
-        ui.notify("Test ESC rozpoczęty!", type='positive')
-    def _run_test_loop(self):
-        pass # Ta pętla nie jest już potrzebna, główna pętla zarządza wszystkim
 
 try:
     stand = ESCTestStand(gpio_pin=GPIO_PIN_ESC)

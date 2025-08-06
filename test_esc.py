@@ -1,21 +1,20 @@
 import time
 import random
 import threading
-
 import pigpio
 from nicegui import ui, app
 
 GPIO_PIN_ESC = 17
 APP_PORT = 8081
-PWM_FREQUENCY = 490     # częstotliwość w Hz
-PWM_RANGE = 255         # zakres duty cycle od 0 do 255
+PWM_FREQUENCY = 490
+PWM_RANGE = 255
 
 
 class ESCTestStand:
     def __init__(self, gpio_pin):
         self.gpio_pin = gpio_pin
 
-        # parametry testu (wskaźniki w µs)
+        # domyślne parametry testu
         self.idle_pwm = 1050
         self.duration_seconds = 60
         self.min_pwm = 1100
@@ -30,24 +29,26 @@ class ESCTestStand:
         self._time_left_at_pause = 0.0
         self._last_update_time = time.time()
 
-        # synchronizacja i flagi
+        # synchronizacja wątków
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._pause_event = threading.Event()
         self._running_event = threading.Event()
         self._armed = False
 
-        # połączenie z pigpio
-        self.pi = pigpio.pi()
-        if not self.pi.connected:
+        # inicjalizacja pigpio
+        pi = pigpio.pi()
+        if not pi.connected:
+            pi.stop()
             raise IOError("Nie można połączyć się z demonem pigpio. Uruchom 'sudo pigpiod'.")
-        self.pi.set_mode(self.gpio_pin, pigpio.OUTPUT)
+        self.pi = pi
 
-        # konfiguracja PWM: 490Hz, 8-bit (0–255)
+        # konfiguracja PWM
+        self.pi.set_mode(self.gpio_pin, pigpio.OUTPUT)
         self.pi.set_PWM_frequency(self.gpio_pin, PWM_FREQUENCY)
         self.pi.set_PWM_range(self.gpio_pin, PWM_RANGE)
 
-        # start pętli PWM
+        # uruchomienie pętli PWM w tle
         self._pwm_thread = threading.Thread(target=self._run_pwm_loop, daemon=True)
         self._pwm_thread.start()
         print("System uruchomiony w trybie ROZBROJONY (bezpieczny).")
@@ -67,7 +68,6 @@ class ESCTestStand:
                 self._last_update_time = now
 
                 if self._running_event.is_set() and not self._pause_event.is_set():
-                    # losowy cel i rampowanie
                     if abs(self._current_pwm - self._target_pwm) < 2:
                         self._target_pwm = random.uniform(self.min_pwm, self.max_pwm)
                     if self._current_pwm < self._target_pwm:
@@ -80,17 +80,16 @@ class ESCTestStand:
                             self._current_pwm - self.ramp_down_per_s * dt,
                             self._target_pwm
                         )
+
                 elif self._armed:
-                    # przy uzbrojeniu utrzymuj idle
                     self._current_pwm = float(self.idle_pwm)
                 else:
                     self._current_pwm = 0.0
 
-                # przelicz na 0–255
-                fraction = self._current_pwm / period_us
-                duty = max(0, min(PWM_RANGE, int(fraction * PWM_RANGE)))
+                # oblicz dutycycle 0–255
+                duty = int((self._current_pwm / period_us) * PWM_RANGE)
+                duty = max(0, min(PWM_RANGE, duty))
 
-            # retry przy ustawianiu PWM
             for attempt in range(3):
                 try:
                     self.pi.set_PWM_dutycycle(self.gpio_pin, duty)
@@ -109,7 +108,7 @@ class ESCTestStand:
         self._stop_event.set()
         self._pwm_thread.join()
         print("Zatrzymywanie i sprzątanie zasobów ESC...")
-        if self.pi.connected:
+        if self.pi and self.pi.connected:
             try:
                 self.pi.set_PWM_dutycycle(self.gpio_pin, 0)
             except Exception:
@@ -126,10 +125,11 @@ class ESCTestStand:
     def disarm_system(self):
         with self._lock:
             if self._running_event.is_set():
-                self.stop_test()
+                # zatrzymaj test, ale bez powiadomienia
+                self.stop_test(notify=False)
             if self._armed:
                 self._armed = False
-                ui.notify("System ROZBROJONY.", type='positive')
+                ui.notify("System ROZBROJONY. (Test zatrzymany)", type='positive')
 
     def start_test(self):
         with self._lock:
@@ -146,13 +146,14 @@ class ESCTestStand:
             self._target_pwm = random.uniform(self.min_pwm, self.max_pwm)
             ui.notify("Test ESC rozpoczęty!", type='positive')
 
-    def stop_test(self):
+    def stop_test(self, notify: bool = True):
         with self._lock:
             if not self._running_event.is_set():
                 return
             self._running_event.clear()
             self._pause_event.clear()
-            ui.notify("Test zatrzymany. Powrót do trybu IDLE.")
+            if notify:
+                ui.notify("Test zatrzymany. Powrót do trybu IDLE.", type='info')
 
     def toggle_pause(self):
         with self._lock:
@@ -169,23 +170,23 @@ class ESCTestStand:
                 ui.notify("Test ZAPAUZOWANY.", type='info')
 
     @property
-    def is_armed(self):
+    def is_armed(self) -> bool:
         return self._armed
 
     @property
-    def is_running(self):
+    def is_running(self) -> bool:
         return self._running_event.is_set()
 
     @property
-    def is_paused(self):
+    def is_paused(self) -> bool:
         return self._pause_event.is_set()
 
     @property
-    def can_start(self):
+    def can_start(self) -> bool:
         return self._armed and not self._running_event.is_set()
 
     @property
-    def status_text(self):
+    def status_text(self) -> str:
         if not self._armed:
             return "ROZBROJONY (BEZPIECZNY)"
         if self.is_running and self.is_paused:
@@ -195,7 +196,7 @@ class ESCTestStand:
         return f"UZBROJONY / IDLE ({self.idle_pwm} µs)"
 
     @property
-    def time_left(self):
+    def time_left(self) -> float:
         if not self.is_running:
             return float(self.duration_seconds)
         if self.is_paused:
@@ -203,51 +204,66 @@ class ESCTestStand:
         return max(0.0, self._end_time - time.time())
 
     @property
-    def elapsed_time(self):
+    def elapsed_time(self) -> float:
         if not self.is_running:
             return 0.0
         return self.duration_seconds - self.time_left
 
     @property
-    def progress(self):
+    def progress(self) -> float:
         if not self.is_running or self.duration_seconds <= 0:
             return 0.0
         return self.elapsed_time / self.duration_seconds
 
+    @property
+    def current_pwm(self) -> float:
+        return self._current_pwm
 
-# inicjalizacja
+
+# inicjalizacja instancji
 try:
     stand = ESCTestStand(GPIO_PIN_ESC)
+    app.on_shutdown(stand.cleanup)
     pigpio_error = None
 except Exception as e:
     stand = None
     pigpio_error = e
 
 
-# budowa UI
 def create_status_card():
-    ui.label('Stanowisko Testowe ESC')\
+    ui.label('Stanowisko Testowe ESC') \
       .classes('text-h3 text-bold q-my-md text-center w-full')
+
     with ui.card().classes('w-full max-w-2xl mx-auto'):
         ui.label('Status na żywo').classes('text-h5')
-        ui.label().classes('text-xl').bind_text_from(stand, 'status_text')
-        ui.label().classes('text-lg font-mono')\
-          .bind_text_from(stand, '_current_pwm', lambda p: f"Aktualne PWM: {p:.2f} µs")
+        ui.label().classes('text-xl') \
+          .bind_text_from(stand, 'status_text')
+
+        ui.label().classes('text-lg font-mono') \
+          .bind_text_from(stand, 'current_pwm',
+                          lambda p: f"Aktualne PWM: {p:.2f} µs")
 
         time_left_label = ui.label().classes('text-lg')
-        with ui.linear_progress(show_value=False)\
-                .bind_value_from(stand, 'progress')\
-                .style('height: 35px; border-radius: 8px;')\
-                .props('instant-feedback'):
-            progress_bar_label = ui.label()\
-                                  .classes('absolute-center text-black text-bold text-h6')
+
+        with ui.linear_progress(show_value=False) \
+              .bind_value_from(stand, 'progress') \
+              .style('height:35px;border-radius:8px;') \
+              .props('instant-feedback'):
+            progress_bar_label = ui.label() \
+                                   .classes('absolute-center text-black '
+                                            'text-bold text-h6')
 
         def update_ui():
             remaining = stand.time_left
-            time_left_label.set_text(f"Czas do końca: {int(remaining//60):02d}:{int(remaining%60):02d}")
+            time_left_label.set_text(
+                f"Czas do końca: {int(remaining//60):02d}:"
+                f"{int(remaining%60):02d}"
+            )
             elapsed = stand.elapsed_time
             progress_bar_label.set_text(
-                f"{stand._current_pwm:.0f} µs | Czas: {int(elapsed//60):02d}:{int(elapsed%60):02d}"
+                f"{stand.current_pwm:.0f}µs | "
+                f"Czas: {int(elapsed//60):02d}:"
+                f"{int(elapsed%60):02d}"
             )
             if remaining <= 0 and stand.is_running and not stand.is_paused:
                 stand.stop_test()
@@ -258,54 +274,73 @@ def create_status_card():
 def create_control_card():
     ui.separator().classes('q-my-md')
     with ui.row().classes('w-full justify-around items-center'):
-        with ui.column():
-            ui.button('UZBRÓJ', on_click=stand.arm_system, color='warning')\
-              .props('icon=lock_open')\
-              .bind_enabled_from(stand, 'is_armed', backward=lambda x: not x)
-            ui.button('ROZBRÓJ', on_click=stand.disarm_system, color='positive')\
-              .props('icon=lock')\
-              .bind_enabled_from(stand, 'is_armed')
-        with ui.column():
-            ui.button('Start Test', on_click=stand.start_test, color='negative')\
-              .props('icon=play_arrow')\
-              .bind_enabled_from(stand, 'can_start')
-            ui.button('Pauza/Wznów', on_click=stand.toggle_pause)\
-              .bind_enabled_from(stand, 'is_running')
-            ui.button('Stop Test', on_click=stand.stop_test)\
-              .bind_enabled_from(stand, 'is_running')
+        ui.button('UZBRÓJ', on_click=stand.arm_system, color='warning') \
+          .props('icon=lock_open') \
+          .bind_enabled_from(stand, 'is_armed', backward=lambda a: not a)
+
+        ui.button('ROZBRÓJ', on_click=stand.disarm_system, color='positive') \
+          .props('icon=lock') \
+          .bind_enabled_from(stand, 'is_armed')
+
+        ui.button('Start Test', on_click=stand.start_test, color='negative') \
+          .props('icon=play_arrow') \
+          .bind_enabled_from(stand, 'can_start')
+
+        pause_btn = ui.button('Pauza', on_click=stand.toggle_pause, color='info') \
+                      .props('icon=pause_circle') \
+                      .bind_enabled_from(stand, 'is_running')
+
+        ui.button('Stop Test', on_click=stand.stop_test, color='negative') \
+          .props('icon=stop') \
+          .bind_enabled_from(stand, 'is_running')
+
+    def update_pause_btn():
+        if stand.is_paused:
+            pause_btn.set_text('Wznów')
+            pause_btn.set_icon('play_arrow')
+        else:
+            pause_btn.set_text('Pauza')
+            pause_btn.set_icon('pause_circle')
+
+    ui.timer(0.1, update_pause_btn)
 
 
 def create_settings_card():
     with ui.card().classes('w-full max-w-2xl mx-auto q-mt-md'):
         ui.label('Ustawienia').classes('text-h5')
         with ui.grid(columns=2).classes('w-full gap-4'):
-            ui.number(label='IDLE PWM (µs)', step=1)\
-              .bind_value(stand, 'idle_pwm')\
-              .bind_enabled_from(stand, 'is_armed', backward=lambda x: not x)
-            ui.number(label='Czas trwania (s)', min=1, max=86400, step=1)\
-              .bind_value(stand, 'duration_seconds')\
-              .bind_enabled_from(stand, 'is_running', backward=lambda x: not x)
-            ui.number(label='Min. PWM w teście (µs)', min=900, max=2500, step=10)\
-              .bind_value(stand, 'min_pwm')\
-              .bind_enabled_from(stand, 'is_running', backward=lambda x: not x)
-            ui.number(label='Max. PWM w teście (µs)', min=900, max=2500, step=10)\
-              .bind_value(stand, 'max_pwm')\
-              .bind_enabled_from(stand, 'is_running', backward=lambda x: not x)
-            ui.number(label='Rampa wzrostu (PWM/s)', min=1, max=1_000_000, step=100)\
-              .bind_value(stand, 'ramp_up_per_s')\
-              .bind_enabled_from(stand, 'is_running', backward=lambda x: not x)
-            ui.number(label='Rampa spadku (PWM/s)', min=1, max=1_000_000, step=100)\
-              .bind_value(stand, 'ramp_down_per_s')\
-              .bind_enabled_from(stand, 'is_running', backward=lambda x: not x)
+            ui.number(label='IDLE PWM (µs)', step=1) \
+              .bind_value(stand, 'idle_pwm') \
+              .bind_enabled_from(stand, 'is_armed', backward=lambda a: not a)
+
+            ui.number(label='Czas trwania (s)', min=1, max=86400, step=1) \
+              .bind_value(stand, 'duration_seconds') \
+              .bind_enabled_from(stand, 'is_running', backward=lambda r: not r)
+
+            ui.number(label='Min. PWM test (µs)', min=900, max=2500, step=10) \
+              .bind_value(stand, 'min_pwm') \
+              .bind_enabled_from(stand, 'is_running', backward=lambda r: not r)
+
+            ui.number(label='Max. PWM test (µs)', min=900, max=2500, step=10) \
+              .bind_value(stand, 'max_pwm') \
+              .bind_enabled_from(stand, 'is_running', backward=lambda r: not r)
+
+            ui.number(label='Rampa wzrostu (PWM/s)', min=1, max=1_000_000, step=100) \
+              .bind_value(stand, 'ramp_up_per_s') \
+              .bind_enabled_from(stand, 'is_running', backward=lambda r: not r)
+
+            ui.number(label='Rampa spadku (PWM/s)', min=1, max=1_000_000, step=100) \
+              .bind_value(stand, 'ramp_down_per_s') \
+              .bind_enabled_from(stand, 'is_running', backward=lambda r: not r)
 
 
 @ui.page('/')
 def main_page():
     if pigpio_error:
-        ui.label("BŁĄD KRYTYCZNY")\
+        ui.label("BŁĄD KRYTYCZNY") \
           .classes("text-h4 text-negative text-center w-full")
         ui.html(
-            "<p>Nie udało się połączyć z demonem <b>pigpio</b>:</p>"
+            f"<p>Nie udało się połączyć z demonem <b>pigpio</b>:</p>"
             f"<pre>{pigpio_error}</pre>"
         ).classes("text-body1 text-center w-full")
         return
@@ -315,7 +350,10 @@ def main_page():
     create_settings_card()
 
 
-if stand:
-    app.on_shutdown(stand.cleanup)
-
-ui.run(title='Stanowisko Testowe ESC', port=APP_PORT, host='0.0.0.0', show=False, reload=False)
+ui.run(
+    title='Stanowisko Testowe ESC',
+    port=APP_PORT,
+    host='0.0.0.0',
+    show=False,
+    reload=False
+)

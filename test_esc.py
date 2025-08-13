@@ -175,6 +175,7 @@ class DShotTransmitter:
         on_mask = 1 << self.gpio
         off_mask = on_mask
 
+        # MSB -> LSB
         for i in range(15, -1, -1):
             bit = (packet >> i) & 1
             if bit:
@@ -183,13 +184,23 @@ class DShotTransmitter:
             else:
                 pulses.append(pigpio.pulse(on_mask, 0, DSHOT0_HIGH_US))
                 pulses.append(pigpio.pulse(0, off_mask, DSHOT0_LOW_US))
+        # przerwa między ramkami
         pulses.append(pigpio.pulse(0, off_mask, DSHOT_FRAME_GAP_US))
 
         self.worker.call('wave_add_new', timeout=1.0)
         self.worker.call('wave_add_generic', pulses, timeout=1.0)
         wid = self.worker.call('wave_create', timeout=1.0)
         if wid < 0:
-            raise RuntimeError("pigpio wave_create failed")
+            # awaryjne czyszczenie i ponowienie
+            try:
+                self.worker.call('wave_clear', timeout=1.0)
+                self.worker.call('wave_add_new', timeout=1.0)
+                self.worker.call('wave_add_generic', pulses, timeout=1.0)
+                wid = self.worker.call('wave_create', timeout=1.0)
+            except Exception:
+                pass
+            if wid < 0:
+                raise RuntimeError(f"pigpio wave_create failed: {wid}")
         return wid
 
     def _get_tx_at(self) -> int:
@@ -312,7 +323,6 @@ class DShotTransmitter:
 
 # -------------------- POMOCNICZE --------------------
 def ramp(current: float, target: float, up_rate: float, down_rate: float, dt: float) -> float:
-    # Bezpieczeństwo: nie pozwól na 0/ujemne
     up_rate = max(1e-6, float(up_rate))
     down_rate = max(1e-6, float(down_rate))
     if current < target:
@@ -324,7 +334,7 @@ def target_when_close(current: float, target: float, min_v: float, max_v: float,
     return random.uniform(min_v, max_v) if abs(current - target) < eps else target
 
 def fmt_mmss(seconds: float) -> str:
-    s = int(max(0.0, float(seconds)))  # bez zaokrągleń do 60
+    s = int(max(0.0, float(seconds)))
     return f"{s//60:02d}:{s%60:02d}"
 
 
@@ -357,7 +367,7 @@ class ESCTestStand:
         self._pu = 1_000_000 / self._pwm_frequency  # okres w µs dla PWM490
 
         # Stany bieżące
-        self._current_pwm = 0.0         # µs (dla PWM50 i PWM490 używamy µs jako abstrakcji)
+        self._current_pwm = 0.0
         self._target_pwm = 0.0
         self._current_dshot = 0.0
         self._target_dshot = 0.0
@@ -404,7 +414,6 @@ class ESCTestStand:
 
         try:
             self._pw.call('set_mode', self.gpio_pin, pigpio.OUTPUT, timeout=1.0)
-            # Inicjalnie ustawiamy PWM490 parametry, bo taki jest domyślny protokół
             r1 = self._pw.call('set_PWM_frequency', self.gpio_pin, self._pwm_frequency, timeout=1.0)
             r2 = self._pw.call('set_PWM_range', self.gpio_pin, self._pwm_range, timeout=1.0)
             if isinstance(r1, int) and r1 < 0:
@@ -421,6 +430,13 @@ class ESCTestStand:
 
         # Nadajnik DShot
         self._dshot_tx = DShotTransmitter(self._pw, self.gpio_pin)
+
+        # Jeśli domyślny protokół to DSHOT300, wystartuj od razu transmisję 0
+        if self._protocol == 'DSHOT300':
+            try:
+                self._dshot_tx.set_throttle(0)
+            except Exception:
+                pass
 
         # Wątek sterujący
         self._pwm_thread = threading.Thread(target=self._run_loop, daemon=True, name='esc-run-loop')
@@ -534,7 +550,7 @@ class ESCTestStand:
                 return
 
             if protocol == 'DSHOT300':
-                # Spróbuj wyłączyć PWM/servo na wszelki wypadek
+                # Wyłącz poprzednie tryby i ustaw niski poziom na pinie
                 try:
                     self._pw.call('set_PWM_dutycycle', self.gpio_pin, 0, timeout=1.0)
                 except Exception:
@@ -543,11 +559,19 @@ class ESCTestStand:
                     self._pw.call('set_servo_pulsewidth', self.gpio_pin, 0, timeout=1.0)
                 except Exception:
                     pass
+                try:
+                    self._pw.call('write', self.gpio_pin, 0, timeout=1.0)
+                except Exception:
+                    pass
                 self._protocol = 'DSHOT300'
                 ui.notify("Protokół: DShot300 (UWAGA: wymagane pigpiod -s 1)", type='info')
+                # WAŻNE: od razu start transmisji z 0
+                try:
+                    self._dshot_tx.set_throttle(0)
+                except Exception:
+                    pass
 
             elif protocol == 'PWM50':
-                # Zatrzymaj PWM i włącz tryb servo
                 try:
                     self._pw.call('set_PWM_dutycycle', self.gpio_pin, 0, timeout=1.0)
                 except Exception:
@@ -556,7 +580,6 @@ class ESCTestStand:
                 ui.notify("Protokół: PWM 50Hz (servo pulses)", type='info')
 
             elif protocol == 'PWM490':
-                # Wyłącz servo i włącz PWM490
                 try:
                     self._pw.call('set_servo_pulsewidth', self.gpio_pin, 0, timeout=1.0)
                 except Exception:
@@ -596,11 +619,15 @@ class ESCTestStand:
                 armed = self._armed
                 proto = self._protocol
 
-                # Domyślne wyjście
-                out = ('NOOP', None)
+                # Domyślne wyjście (ZAWSZE zdefiniowane)
+                if proto == 'DSHOT300':
+                    out = ('DSHOT', 0)
+                elif proto == 'PWM50':
+                    out = ('SERVO', 0)
+                else:
+                    out = ('PWM', 0)
 
                 if self._finishing:
-                    # Rampa do idle (niezależna od RUNNING/PAUSE)
                     if proto == 'DSHOT300':
                         target = float(max(DSHOT_MIN_THROTTLE, min(DSHOT_MAX_THROTTLE, self.dshot_idle)))
                         self._target_dshot = target
@@ -612,23 +639,15 @@ class ESCTestStand:
                     elif proto == 'PWM50':
                         target = float(self.idle_pwm)
                         self._target_pwm = target
-                        self._current_pwm = ramp(
-                            self._current_pwm, target,
-                            self.ramp_up_per_s, self.ramp_down_per_s, dt
-                        )
+                        self._current_pwm = ramp(self._current_pwm, target, self.ramp_up_per_s, self.ramp_down_per_s, dt)
                         out = ('SERVO', int(self._current_pwm))
                     else:  # PWM490
                         target = float(self.idle_pwm)
                         self._target_pwm = target
-                        self._current_pwm = ramp(
-                            self._current_pwm, target,
-                            self.ramp_up_per_s, self.ramp_down_per_s, dt
-                        )
+                        self._current_pwm = ramp(self._current_pwm, target, self.ramp_up_per_s, self.ramp_down_per_s, dt)
                         duty = int((self._current_pwm / self._pu) * self._pwm_range)
-                        duty = max(0, min(self._pwm_range, duty))
-                        out = ('PWM', duty)
+                        out = ('PWM', max(0, min(self._pwm_range, duty)))
 
-                    # Kryteria zakończenia FINISHING
                     close_enough = (abs((self._current_dshot if proto == 'DSHOT300' else self._current_pwm) - target) < 1.0)
                     timeout_reached = (now >= self._finishing_deadline) if self._finishing_deadline > 0 else False
                     if close_enough or timeout_reached:
@@ -639,7 +658,6 @@ class ESCTestStand:
                         self._time_left_at_pause = 0.0
 
                 elif running and not paused:
-                    # Sprawdź KONIEC CZASU: natychmiast przejdź do FINISHING i policz rampę już teraz
                     if now >= self._end_time:
                         self._running_event.clear()
                         self._finishing = True
@@ -661,58 +679,33 @@ class ESCTestStand:
                         elif proto == 'PWM50':
                             target = float(self.idle_pwm)
                             self._target_pwm = target
-                            self._current_pwm = ramp(
-                                self._current_pwm, target,
-                                self.ramp_up_per_s, self.ramp_down_per_s, dt
-                            )
+                            self._current_pwm = ramp(self._current_pwm, target, self.ramp_up_per_s, self.ramp_down_per_s, dt)
                             out = ('SERVO', int(self._current_pwm))
                         else:
                             target = float(self.idle_pwm)
                             self._target_pwm = target
-                            self._current_pwm = ramp(
-                                self._current_pwm, target,
-                                self.ramp_up_per_s, self.ramp_down_per_s, dt
-                            )
+                            self._current_pwm = ramp(self._current_pwm, target, self.ramp_up_per_s, self.ramp_down_per_s, dt)
                             duty = int((self._current_pwm / self._pu) * self._pwm_range)
-                            duty = max(0, min(self._pwm_range, duty))
-                            out = ('PWM', duty)
+                            out = ('PWM', max(0, min(self._pwm_range, duty)))
 
                     else:
-                        # Normalny bieg testu
                         if proto == 'DSHOT300':
-                            self._target_dshot = target_when_close(
-                                self._current_dshot, self._target_dshot,
-                                self.dshot_min, self.dshot_max
-                            )
-                            self._current_dshot = ramp(
-                                self._current_dshot, self._target_dshot,
-                                self.dshot_ramp_up_per_s, self.dshot_ramp_down_per_s, dt
-                            )
+                            self._target_dshot = target_when_close(self._current_dshot, self._target_dshot, self.dshot_min, self.dshot_max)
+                            self._current_dshot = ramp(self._current_dshot, self._target_dshot,
+                                                       self.dshot_ramp_up_per_s, self.dshot_ramp_down_per_s, dt)
                             out = ('DSHOT', int(max(0, min(DSHOT_MAX_THROTTLE, round(self._current_dshot)))))
                         elif proto == 'PWM50':
-                            self._target_pwm = target_when_close(
-                                self._current_pwm, self._target_pwm,
-                                self.min_pwm, self.max_pwm
-                            )
-                            self._current_pwm = ramp(
-                                self._current_pwm, self._target_pwm,
-                                self.ramp_up_per_s, self.ramp_down_per_s, dt
-                            )
+                            self._target_pwm = target_when_close(self._current_pwm, self._target_pwm, self.min_pwm, self.max_pwm)
+                            self._current_pwm = ramp(self._current_pwm, self._target_pwm,
+                                                     self.ramp_up_per_s, self.ramp_down_per_s, dt)
                             out = ('SERVO', int(self._current_pwm))
-                        else:  # PWM490
-                            self._target_pwm = target_when_close(
-                                self._current_pwm, self._target_pwm,
-                                self.min_pwm, self.max_pwm
-                            )
-                            self._current_pwm = ramp(
-                                self._current_pwm, self._target_pwm,
-                                self.ramp_up_per_s, self.ramp_down_per_s, dt
-                            )
+                        else:
+                            self._target_pwm = target_when_close(self._current_pwm, self._target_pwm, self.min_pwm, self.max_pwm)
+                            self._current_pwm = ramp(self._current_pwm, self._target_pwm,
+                                                     self.ramp_up_per_s, self.ramp_down_per_s, dt)
                             duty = int((self._current_pwm / self._pu) * self._pwm_range)
-                            duty = max(0, min(self._pwm_range, duty))
-                            out = ('PWM', duty)
+                            out = ('PWM', max(0, min(self._pwm_range, duty)))
 
-                        # snapshoty dla UI
                         if self.duration_seconds > 0:
                             elapsed = min(self.duration_seconds, max(0.0, now - self._start_time))
                             self._elapsed_snapshot = elapsed
@@ -720,7 +713,6 @@ class ESCTestStand:
                             self._time_left_snapshot = max(0.0, self._end_time - now)
 
                 elif armed:
-                    # idle
                     if proto == 'DSHOT300':
                         self._current_dshot = float(max(DSHOT_MIN_THROTTLE, min(DSHOT_MAX_THROTTLE, self.dshot_idle)))
                         self._target_dshot = self._current_dshot
@@ -733,15 +725,15 @@ class ESCTestStand:
                         self._current_pwm = float(self.idle_pwm)
                         self._target_pwm = float(self.idle_pwm)
                         duty = int((self._current_pwm / self._pu) * self._pwm_range)
-                        duty = max(0, min(self._pwm_range, duty))
-                        out = ('PWM', duty)
+                        out = ('PWM', max(0, min(self._pwm_range, duty)))
                 else:
-                    # DISARMED: nie wysyłamy nic (unikamy ożywiania DShot przy 0)
-                    self._current_pwm = 0.0
-                    self._target_pwm = 0.0
-                    self._current_dshot = 0.0
-                    self._target_dshot = 0.0
-                    out = ('NOOP', None)
+                    # DISARMED: ciągła transmisja 0
+                    if proto == 'DSHOT300':
+                        out = ('DSHOT', 0)
+                    elif proto == 'PWM50':
+                        out = ('SERVO', 0)
+                    else:
+                        out = ('PWM', 0)
 
             # Wyślij sygnał
             try:
@@ -751,14 +743,12 @@ class ESCTestStand:
                     self._dshot_tx.set_throttle(out[1])
                 elif out[0] == 'SERVO':
                     self._pw.call('set_servo_pulsewidth', self.gpio_pin, int(out[1]), retries=3, timeout=1.0)
-                elif out[0] == 'PWM':
-                    self._pw.call('set_PWM_dutycycle', self.gpio_pin, out[1], retries=3, timeout=1.0)
                 else:
-                    pass  # NOOP
+                    self._pw.call('set_PWM_dutycycle', self.gpio_pin, out[1], retries=3, timeout=1.0)
             except Exception as e:
                 self._handle_pigpio_error(e)
 
-            # Tempo pętli z natychmiastowym wybudzaniem
+            # Tempo pętli
             elapsed = time.time() - loop_start
             if out[0] == 'DSHOT':
                 timeout = max(0.0, 0.001 - elapsed)  # ~1 kHz
@@ -783,8 +773,9 @@ class ESCTestStand:
             self._time_left_snapshot = float(self.duration_seconds)
 
             if self._protocol == 'DSHOT300':
-                self._current_dshot = float(max(DSHOT_MIN_THROTTLE, min(DSHOT_MAX_THROTTLE, self.dshot_idle)))
-                self._target_dshot = self._current_dshot
+                # start od 0 (krótko), potem idle
+                self._current_dshot = 0.0
+                self._target_dshot = 0.0
             else:
                 self._current_pwm = float(self.idle_pwm)
                 self._target_pwm = float(self.idle_pwm)
@@ -792,7 +783,19 @@ class ESCTestStand:
 
         try:
             if self._protocol == 'DSHOT300':
-                self._dshot_tx.set_throttle(int(self._current_dshot))
+                # Wyślij 0 teraz, po 200ms przejdź na idle
+                self._dshot_tx.set_throttle(0)
+                def set_idle():
+                    with self._lock:
+                        if self._armed and self._protocol == 'DSHOT300':
+                            idle_val = int(max(DSHOT_MIN_THROTTLE, min(DSHOT_MAX_THROTTLE, self.dshot_idle)))
+                            self._current_dshot = float(idle_val)
+                            self._target_dshot = float(idle_val)
+                            try:
+                                self._dshot_tx.set_throttle(idle_val)
+                            except Exception:
+                                pass
+                threading.Timer(0.2, set_idle).start()
             elif self._protocol == 'PWM50':
                 self._pw.call('set_servo_pulsewidth', self.gpio_pin, int(self.idle_pwm), retries=3, timeout=1.0)
             else:
@@ -833,14 +836,11 @@ class ESCTestStand:
 
         try:
             if self._protocol == 'DSHOT300':
-                self._dshot_tx.stop()
+                # dalej transmitujemy 0 (ciągłość ramek)
                 try:
-                    self._pw.call('write', self.gpio_pin, 0, timeout=1.0)
+                    self._dshot_tx.set_throttle(0)
                 except Exception:
-                    try:
-                        self.pi.write(self.gpio_pin, 0)
-                    except Exception:
-                        pass
+                    pass
             elif self._protocol == 'PWM50':
                 try:
                     self._pw.call('set_servo_pulsewidth', self.gpio_pin, 0, timeout=1.0)
@@ -872,7 +872,6 @@ class ESCTestStand:
                 if self.dshot_min >= self.dshot_max:
                     self._notify_bg("DShot: MIN musi być < MAX", type_='negative')
                     return
-                # Upewnij się, że idle jest poprawny
                 self.dshot_idle = int(max(DSHOT_MIN_THROTTLE, min(DSHOT_MAX_THROTTLE, self.dshot_idle)))
             else:
                 if self.min_pwm >= self.max_pwm:
@@ -896,8 +895,6 @@ class ESCTestStand:
 
             if self._protocol == 'DSHOT300':
                 self._target_dshot = random.uniform(self.dshot_min, self.dshot_max)
-            elif self._protocol == 'PWM50':
-                self._target_pwm = random.uniform(self.min_pwm, self.max_pwm)
             else:
                 self._target_pwm = random.uniform(self.min_pwm, self.max_pwm)
 
@@ -911,7 +908,6 @@ class ESCTestStand:
             finishing_now = self._finishing
 
             if hard:
-                # Natychmiast
                 self._running_event.clear()
                 self._pause_event.clear()
                 self._finishing = False
@@ -927,7 +923,6 @@ class ESCTestStand:
                 self._last_update_time = time.time()
             else:
                 if not finishing_now:
-                    # Miękki STOP: natychmiast zatrzymaj RUNNING (UI zamraża progress)
                     self._running_event.clear()
                     self._pause_event.clear()
                     self._stopping_soft = True
@@ -939,18 +934,11 @@ class ESCTestStand:
                     else:
                         self._target_pwm = float(self.idle_pwm)
 
-        # Sprzęt dla HARD STOP poza lockiem
         if hard:
             try:
                 if proto == 'DSHOT300':
-                    self._dshot_tx.stop()
-                    try:
-                        self._pw.call('write', self.gpio_pin, 0, timeout=1.0)
-                    except Exception:
-                        try:
-                            self.pi.write(self.gpio_pin, 0)
-                        except Exception:
-                            pass
+                    # utrzymujemy transmisję, ustawiamy 0
+                    self._dshot_tx.set_throttle(0)
                 elif proto == 'PWM50':
                     try:
                         self._pw.call('set_servo_pulsewidth', self.gpio_pin, 0, timeout=1.0)
@@ -992,12 +980,11 @@ class ESCTestStand:
                 # RESUME
                 self._pause_event.clear()
                 self._end_time = now + self._time_left_at_pause
-                # Stabilnie wznowienie: elapsed od snapshotu
                 self._start_time = now - self._elapsed_snapshot
                 self._last_update_time = now
                 msg = "TEST RESUMED"
             else:
-                # PAUSE: zamroź time_left na snapshot
+                # PAUSE
                 self._pause_event.set()
                 self._time_left_at_pause = max(0.0, self._end_time - now)
                 self._time_left_snapshot = self._time_left_at_pause
@@ -1056,7 +1043,6 @@ class ESCTestStand:
         if self.is_paused:
             return self._time_left_at_pause
         if self._finishing:
-            # zamrożone
             return self._time_left_snapshot
         return float(self.duration_seconds)
 

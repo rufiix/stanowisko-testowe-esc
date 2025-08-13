@@ -57,9 +57,18 @@ class PigpioWorker:
         self._q: "queue.Queue[Optional[tuple]]" = queue.Queue()
         self._stop_event = threading.Event()
         self._thread = threading.Thread(target=self._loop, daemon=True, name=name)
+        self._thread_id: Optional[int] = None  # ID wątku workera (dla reentrancy)
         self._thread.start()
+        # Poczekaj aż wątek się uruchomi (max ~5 s)
+        for _ in range(50):
+            if self._thread_id is not None:
+                break
+            time.sleep(0.1)
 
     def _loop(self):
+        # Zapisz ID wątku (do reentrancy detection)
+        self._thread_id = threading.get_ident()
+
         while not self._stop_event.is_set():
             try:
                 item = self._q.get(timeout=0.1)
@@ -108,12 +117,16 @@ class PigpioWorker:
         if last_exc:
             raise last_exc
 
-    def call(self, func: Any, *args, retries: int = 3, retry_delay: float = 0.02, timeout: Optional[float] = 5.0, **kwargs):
+    def call(self, func: Any, *args, retries: int = 3, retry_delay: float = 0.02,
+             timeout: Optional[float] = 5.0, **kwargs):
         if self._stop_event.is_set():
             raise RuntimeError("PigpioWorker is stopped")
-        if threading.get_ident() == getattr(self._thread, 'ident', None):
+
+        # Wykonaj inline, jeżeli jesteśmy w wątku workera (zapobiega deadlockom)
+        if threading.get_ident() == self._thread_id:
             return self._execute(func, args, kwargs, retries, retry_delay)
 
+        # Inny wątek: użyj kolejki i Future
         fut: Future = Future()
         self._q.put((func, args, kwargs, retries, retry_delay, fut))
         try:
@@ -145,6 +158,9 @@ class PigpioWorker:
 # -------------------- DSHOT TX --------------------
 class DShotTransmitter:
     """Nadajnik DShot oparty o pigpio wave z bezpiecznym przełączaniem i kasowaniem (via PigpioWorker)."""
+
+    MAX_PENDING_DELETES = 100  # Limit kolejki oczekujących usunięć
+
     def __init__(self, worker: PigpioWorker, gpio: int):
         self.worker = worker
         self.gpio = gpio
@@ -166,9 +182,58 @@ class DShotTransmitter:
         csum &= 0xF
         return (payload << 4) | csum
 
+    def _cleanup_old_waves(self):
+        """Usuń stare i nieużywane fale (gdy zasoby są wysoko użyte)."""
+        tx_at = self._get_tx_at()
+        now = time.time()
+        to_delete = []
+        with self._lock:
+            remaining = deque()
+            while self._pending_delete:
+                wid, safe_time = self._pending_delete.popleft()
+                if (safe_time <= now) and (wid != tx_at) and (wid != self._current_wid):
+                    to_delete.append(wid)
+                    self._pending_ids.discard(wid)
+                else:
+                    remaining.append((wid, safe_time))
+            self._pending_delete = remaining
+
+        for wid in to_delete:
+            try:
+                self.worker.call('wave_delete', wid, timeout=0.5)
+            except Exception:
+                pass
+
+    def _emergency_cleanup(self):
+        """Usuń tylko nieaktywne fale (awaryjnie, bez wave_clear())."""
+        with self._lock:
+            tx_at = self._get_tx_at()
+            to_delete = []
+
+            # Zbierz fale do usunięcia (oprócz aktualnie transmitowanej i bieżącej)
+            for wid, _ in list(self._pending_delete):
+                if wid != tx_at and wid != self._current_wid:
+                    to_delete.append(wid)
+
+            # Oczyść kolejkę z pozycji do usunięcia
+            self._pending_delete = deque(
+                (w, t) for w, t in self._pending_delete
+                if w == tx_at or w == self._current_wid
+            )
+
+        # Usuń fale poza lockiem
+        for wid in to_delete:
+            try:
+                self.worker.call('wave_delete', wid, timeout=0.5)
+                with self._lock:
+                    self._pending_ids.discard(wid)
+            except Exception:
+                pass
+
     def _build_wave(self, throttle: int) -> int:
         if not self.worker.connected:
             raise ConnectionError("pigpio disconnected")
+
         packet = self._make_packet(throttle, telemetry=0)
 
         pulses = []
@@ -187,20 +252,29 @@ class DShotTransmitter:
         # przerwa między ramkami
         pulses.append(pigpio.pulse(0, off_mask, DSHOT_FRAME_GAP_US))
 
+        # Sprawdź zasoby i ewentualnie posprzątaj stare fale
+        try:
+            max_cbs = self.worker.call('wave_get_max_cbs', timeout=1.0)
+            cur_cbs = self.worker.call('wave_get_cbs', timeout=1.0)
+            # Przybliż, ile "fal" zajmują CB (dzielnik ~25 jako heurystyka)
+            max_waves = int(max_cbs) // 25 if isinstance(max_cbs, int) else 0
+            current_waves = int(cur_cbs) // 25 if isinstance(cur_cbs, int) else 0
+            if max_waves > 0 and current_waves > max_waves * 0.8:
+                self._cleanup_old_waves()
+        except Exception:
+            pass
+
         self.worker.call('wave_add_new', timeout=1.0)
         self.worker.call('wave_add_generic', pulses, timeout=1.0)
         wid = self.worker.call('wave_create', timeout=1.0)
         if wid < 0:
-            # awaryjne czyszczenie i ponowienie
-            try:
-                self.worker.call('wave_clear', timeout=1.0)
-                self.worker.call('wave_add_new', timeout=1.0)
-                self.worker.call('wave_add_generic', pulses, timeout=1.0)
-                wid = self.worker.call('wave_create', timeout=1.0)
-            except Exception:
-                pass
+            # Zamiast wave_clear() — sprzątnij nieaktywne fale i spróbuj ponownie
+            self._emergency_cleanup()
+            self.worker.call('wave_add_new', timeout=1.0)
+            self.worker.call('wave_add_generic', pulses, timeout=1.0)
+            wid = self.worker.call('wave_create', timeout=1.0)
             if wid < 0:
-                raise RuntimeError(f"pigpio wave_create failed: {wid}")
+                raise RuntimeError(f"pigpio wave_create failed after cleanup: {wid}")
         return wid
 
     def _get_tx_at(self) -> int:
@@ -248,6 +322,7 @@ class DShotTransmitter:
         throttle = max(0, min(DSHOT_MAX_THROTTLE, int(throttle)))
 
         with self._tx_lock:
+            # Trzymaj locki w przewidywalnym scope
             with self._lock:
                 if throttle == self._last_throttle and self._current_wid is not None:
                     return
@@ -260,31 +335,44 @@ class DShotTransmitter:
             try:
                 new_wid = self._build_wave(throttle)
 
+                # Sprawdź aktualność w tym samym scope locka
                 with self._lock:
-                    stale = (req_id != self._req_counter) or (self._last_throttle != throttle)
+                    if req_id != self._req_counter or self._last_throttle != throttle:
+                        # Stary request — usuń nową falę asynchronicznie
+                        try:
+                            self.worker.submit('wave_delete', new_wid, retries=1)
+                        except Exception:
+                            pass
+                        return
 
-                if stale:
-                    try:
-                        self.worker.call('wave_delete', new_wid, timeout=1.0)
-                    except Exception:
-                        pass
-                    return
+                    # Wszystko OK — ustaw jako bieżącą falę
+                    self._current_wid = new_wid
 
+                # Wyślij falę (po ustawieniu _current_wid)
                 try:
                     mode = getattr(pigpio, 'WAVE_MODE_REPEAT_SYNC', 3)
                     self.worker.call('wave_send_using_mode', new_wid, mode, timeout=1.0)
                 except AttributeError:
                     self.worker.call('wave_send_repeat', new_wid, timeout=1.0)
 
+                # Zaplanuj usunięcie poprzedniej i ogranicz rozmiar kolejki pending_delete
                 with self._lock:
-                    current_now = self._current_wid
-                    self._current_wid = new_wid
-                    if prev_wid is not None and prev_wid == current_now:
-                        if prev_wid not in self._pending_ids:
-                            self._pending_ids.add(prev_wid)
-                            self._pending_delete.append((prev_wid, time.time() + DSHOT_WAVE_DELETE_DELAY_S))
+                    while len(self._pending_delete) > self.MAX_PENDING_DELETES:
+                        oldest_wid, _ = self._pending_delete.popleft()
+                        self._pending_ids.discard(oldest_wid)
+                        try:
+                            self.worker.call('wave_delete', oldest_wid, timeout=0.1)
+                        except Exception:
+                            pass
+
+                    if prev_wid is not None and prev_wid not in self._pending_ids:
+                        self._pending_ids.add(prev_wid)
+                        self._pending_delete.append((prev_wid, time.time() + DSHOT_WAVE_DELETE_DELAY_S))
 
             except Exception:
+                with self._lock:
+                    if self._current_wid == new_wid:
+                        self._current_wid = prev_wid  # Rollback
                 if new_wid is not None:
                     try:
                         self.worker.call('wave_delete', new_wid, timeout=1.0)
@@ -342,6 +430,16 @@ def fmt_mmss(seconds: float) -> str:
 class ESCTestStand:
     def __init__(self, gpio_pin: int):
         self.gpio_pin = gpio_pin
+
+        # Logger dla błędów
+        self._logger = logging.getLogger('ESCTestStand')
+        self._logger.setLevel(logging.INFO)
+        if not self._logger.handlers:
+            fh = logging.FileHandler('esc_test_errors.log')
+            fh.setLevel(logging.ERROR)
+            formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+            fh.setFormatter(formatter)
+            self._logger.addHandler(fh)
 
         # Ustawienia testu (globalne)
         self.duration_seconds = DEFAULT_DURATION
@@ -403,8 +501,8 @@ class ESCTestStand:
         if not self.pi.connected:
             try:
                 self.pi.stop()
-            except Exception:
-                pass
+            except Exception as e:
+                self._log_error("pigpio stop during init", e)
             raise IOError("pigpio daemon not running! Uruchom: sudo pigpiod -s 1")
 
         # Worker do pigpio
@@ -413,9 +511,9 @@ class ESCTestStand:
         self._notify_bg("Upewnij się, że pigpiod działa z -s 1 (1µs) dla DShot.", 'warning')
 
         try:
-            self._pw.call('set_mode', self.gpio_pin, pigpio.OUTPUT, timeout=1.0)
-            r1 = self._pw.call('set_PWM_frequency', self.gpio_pin, self._pwm_frequency, timeout=1.0)
-            r2 = self._pw.call('set_PWM_range', self.gpio_pin, self._pwm_range, timeout=1.0)
+            self._safe_pigpio_call('set_mode', self.gpio_pin, pigpio.OUTPUT, timeout=1.0)
+            r1 = self._safe_pigpio_call('set_PWM_frequency', self.gpio_pin, self._pwm_frequency, timeout=1.0)
+            r2 = self._safe_pigpio_call('set_PWM_range', self.gpio_pin, self._pwm_range, timeout=1.0)
             if isinstance(r1, int) and r1 < 0:
                 raise RuntimeError(f"set_PWM_frequency failed: {r1}")
             if isinstance(r2, int) and r2 < 0:
@@ -424,8 +522,8 @@ class ESCTestStand:
             self._pw.stop()
             try:
                 self.pi.stop()
-            except Exception:
-                pass
+            except Exception as e:
+                self._log_error("pigpio stop after init error", e)
             raise IOError(f"pigpio initialization error: {err}")
 
         # Nadajnik DShot
@@ -435,12 +533,96 @@ class ESCTestStand:
         if self._protocol == 'DSHOT300':
             try:
                 self._dshot_tx.set_throttle(0)
-            except Exception:
-                pass
+            except Exception as e:
+                self._log_error("Initial DShot throttle=0 failed", e)
 
         # Wątek sterujący
         self._pwm_thread = threading.Thread(target=self._run_loop, daemon=True, name='esc-run-loop')
         self._pwm_thread.start()
+
+    # ---------- Logowanie / bezpieczne wywołania ----------
+    def _log_error(self, context: str, error: Exception):
+        self._logger.error(f"{context}: {type(error).__name__}: {str(error)}", exc_info=True)
+
+    def _safe_pigpio_call(self, method: str, *args, **kwargs):
+        """Bezpieczne wywołanie metody pigpio z obsługą rozłączenia."""
+        if not self.pi.connected:
+            self._handle_pigpio_disconnected()
+            raise ConnectionError("pigpio disconnected")
+
+        try:
+            return self._pw.call(method, *args, **kwargs)
+        except ConnectionError:
+            # Rozłączenie w trakcie
+            self._handle_pigpio_disconnected()
+            raise
+        except Exception as e:
+            # Loguj inne błędy
+            self._log_error(f"pigpio call failed: {method}", e)
+            raise
+
+    def _handle_pigpio_disconnected(self):
+        """Obsłuż rozłączenie z pigpio."""
+        with self._lock:
+            was_armed = self._armed
+            # Natychmiastowe zatrzymanie
+            self._armed = False
+            self._running_event.clear()
+            self._finishing = False
+
+        if was_armed:
+            self._notify_bg("PIGPIO DISCONNECTED - EMERGENCY STOP", 'negative')
+
+        # Spróbuj ponownego połączenia
+        self._attempt_reconnect()
+
+    def _attempt_reconnect(self):
+        """Próba ponownego połączenia z pigpio."""
+        try:
+            if self.pi.connected:
+                return
+
+            # Zamknij stare połączenie
+            try:
+                self.pi.stop()
+            except Exception as e:
+                self._log_error("pi.stop during reconnect", e)
+
+            # Nowe połączenie
+            self.pi = pigpio.pi()
+            if self.pi.connected:
+                # Reinicjalizacja workera i DShot
+                old_worker = self._pw
+                self._pw = PigpioWorker(self.pi)
+                try:
+                    old_worker.stop()
+                except Exception as e:
+                    self._log_error("old_worker.stop during reconnect", e)
+
+                self._dshot_tx = DShotTransmitter(self._pw, self.gpio_pin)
+
+                # Podstawowa re-konfiguracja GPIO
+                try:
+                    self._safe_pigpio_call('set_mode', self.gpio_pin, pigpio.OUTPUT, timeout=1.0)
+                    if self._protocol == 'PWM490':
+                        self._safe_pigpio_call('set_PWM_frequency', self.gpio_pin, self._pwm_frequency, timeout=1.0)
+                        self._safe_pigpio_call('set_PWM_range', self.gpio_pin, self._pwm_range, timeout=1.0)
+                    elif self._protocol == 'PWM50':
+                        self._safe_pigpio_call('set_servo_pulsewidth', self.gpio_pin, 0, timeout=1.0)
+                    elif self._protocol == 'DSHOT300':
+                        try:
+                            self._dshot_tx.set_throttle(0)
+                        except Exception as e:
+                            self._log_error("DShot set_throttle(0) after reconnect", e)
+                except Exception as e:
+                    self._log_error("GPIO reconfiguration after reconnect", e)
+
+                self._notify_bg("Reconnected to pigpio", 'positive')
+            else:
+                self._notify_bg("Failed to reconnect to pigpio", 'negative')
+
+        except Exception as e:
+            self._log_error("Reconnection failed", e)
 
     # ---------- Powiadomienia ----------
     def _notify_bg(self, msg: str, type_: str = 'info'):
@@ -462,11 +644,12 @@ class ESCTestStand:
         self.cleanup()
 
     def _handle_pigpio_error(self, e: Exception):
+        self._log_error("pigpio error", e)
         self._notify_bg(f"pigpio error: {e}", 'negative')
         try:
             self.disarm_system()
-        except Exception:
-            pass
+        except Exception as ex:
+            self._log_error("disarm_system after pigpio error", ex)
 
     def cleanup(self):
         self._stop_event.set()
@@ -477,46 +660,37 @@ class ESCTestStand:
 
         try:
             self._dshot_tx.stop()
-        except Exception:
-            pass
+        except Exception as e:
+            self._log_error("Failed to stop DShot transmitter", e)
 
         try:
             if self._protocol == 'DSHOT300':
                 try:
-                    self._pw.call('write', self.gpio_pin, 0, timeout=1.0)
-                except Exception:
-                    try:
-                        self.pi.write(self.gpio_pin, 0)
-                    except Exception:
-                        pass
+                    self._safe_pigpio_call('write', self.gpio_pin, 0, timeout=1.0)
+                except Exception as e:
+                    self._log_error("Failed to write 0 on DSHOT300 during cleanup", e)
             elif self._protocol == 'PWM50':
                 try:
-                    self._pw.call('set_servo_pulsewidth', self.gpio_pin, 0, timeout=1.0)
-                except Exception:
-                    try:
-                        self.pi.set_servo_pulsewidth(self.gpio_pin, 0)
-                    except Exception:
-                        pass
+                    self._safe_pigpio_call('set_servo_pulsewidth', self.gpio_pin, 0, timeout=1.0)
+                except Exception as e:
+                    self._log_error("Failed to set_servo_pulsewidth 0 during cleanup", e)
             else:
                 try:
-                    self._pw.call('set_PWM_dutycycle', self.gpio_pin, 0, timeout=1.0)
-                except Exception:
-                    try:
-                        self.pi.set_PWM_dutycycle(self.gpio_pin, 0)
-                    except Exception:
-                        pass
-        except Exception:
-            pass
+                    self._safe_pigpio_call('set_PWM_dutycycle', self.gpio_pin, 0, timeout=1.0)
+                except Exception as e:
+                    self._log_error("Failed to set_PWM_dutycycle 0 during cleanup", e)
+        except Exception as e:
+            self._log_error("Failed to reset GPIO in cleanup", e)
 
         try:
             self._pw.stop()
-        except Exception:
-            pass
+        except Exception as e:
+            self._log_error("PigpioWorker.stop in cleanup", e)
         try:
             if self.pi.connected:
                 self.pi.stop()
-        except Exception:
-            pass
+        except Exception as e:
+            self._log_error("pigpio.stop in cleanup", e)
 
     # ---------- Protokół ----------
     @property
@@ -552,15 +726,15 @@ class ESCTestStand:
             if protocol == 'DSHOT300':
                 # Wyłącz poprzednie tryby i ustaw niski poziom na pinie
                 try:
-                    self._pw.call('set_PWM_dutycycle', self.gpio_pin, 0, timeout=1.0)
+                    self._safe_pigpio_call('set_PWM_dutycycle', self.gpio_pin, 0, timeout=1.0)
                 except Exception:
                     pass
                 try:
-                    self._pw.call('set_servo_pulsewidth', self.gpio_pin, 0, timeout=1.0)
+                    self._safe_pigpio_call('set_servo_pulsewidth', self.gpio_pin, 0, timeout=1.0)
                 except Exception:
                     pass
                 try:
-                    self._pw.call('write', self.gpio_pin, 0, timeout=1.0)
+                    self._safe_pigpio_call('write', self.gpio_pin, 0, timeout=1.0)
                 except Exception:
                     pass
                 self._protocol = 'DSHOT300'
@@ -568,12 +742,12 @@ class ESCTestStand:
                 # WAŻNE: od razu start transmisji z 0
                 try:
                     self._dshot_tx.set_throttle(0)
-                except Exception:
-                    pass
+                except Exception as e:
+                    self._log_error("DShot set_throttle(0) on set_protocol", e)
 
             elif protocol == 'PWM50':
                 try:
-                    self._pw.call('set_PWM_dutycycle', self.gpio_pin, 0, timeout=1.0)
+                    self._safe_pigpio_call('set_PWM_dutycycle', self.gpio_pin, 0, timeout=1.0)
                 except Exception:
                     pass
                 self._protocol = 'PWM50'
@@ -581,13 +755,13 @@ class ESCTestStand:
 
             elif protocol == 'PWM490':
                 try:
-                    self._pw.call('set_servo_pulsewidth', self.gpio_pin, 0, timeout=1.0)
+                    self._safe_pigpio_call('set_servo_pulsewidth', self.gpio_pin, 0, timeout=1.0)
                 except Exception:
                     pass
                 freq = 490
                 try:
-                    r1 = self._pw.call('set_PWM_frequency', self.gpio_pin, freq, timeout=1.0)
-                    r2 = self._pw.call('set_PWM_range', self.gpio_pin, self._pwm_range, timeout=1.0)
+                    r1 = self._safe_pigpio_call('set_PWM_frequency', self.gpio_pin, freq, timeout=1.0)
+                    r2 = self._safe_pigpio_call('set_PWM_range', self.gpio_pin, self._pwm_range, timeout=1.0)
                     if isinstance(r1, int) and r1 < 0:
                         raise RuntimeError(f"set_PWM_frequency failed: {r1}")
                     if isinstance(r2, int) and r2 < 0:
@@ -742,9 +916,9 @@ class ESCTestStand:
                 if out[0] == 'DSHOT':
                     self._dshot_tx.set_throttle(out[1])
                 elif out[0] == 'SERVO':
-                    self._pw.call('set_servo_pulsewidth', self.gpio_pin, int(out[1]), retries=3, timeout=1.0)
+                    self._safe_pigpio_call('set_servo_pulsewidth', self.gpio_pin, int(out[1]), retries=3, timeout=1.0)
                 else:
-                    self._pw.call('set_PWM_dutycycle', self.gpio_pin, out[1], retries=3, timeout=1.0)
+                    self._safe_pigpio_call('set_PWM_dutycycle', self.gpio_pin, out[1], retries=3, timeout=1.0)
             except Exception as e:
                 self._handle_pigpio_error(e)
 
@@ -785,6 +959,7 @@ class ESCTestStand:
             if self._protocol == 'DSHOT300':
                 # Wyślij 0 teraz, po 200ms przejdź na idle
                 self._dshot_tx.set_throttle(0)
+
                 def set_idle():
                     with self._lock:
                         if self._armed and self._protocol == 'DSHOT300':
@@ -793,20 +968,21 @@ class ESCTestStand:
                             self._target_dshot = float(idle_val)
                             try:
                                 self._dshot_tx.set_throttle(idle_val)
-                            except Exception:
-                                pass
+                            except Exception as e:
+                                self._log_error("DShot set_idle after arm", e)
+
                 threading.Timer(0.2, set_idle).start()
             elif self._protocol == 'PWM50':
-                self._pw.call('set_servo_pulsewidth', self.gpio_pin, int(self.idle_pwm), retries=3, timeout=1.0)
+                self._safe_pigpio_call('set_servo_pulsewidth', self.gpio_pin, int(self.idle_pwm), retries=3, timeout=1.0)
             else:
                 duty = int((self.idle_pwm / self._pu) * self._pwm_range)
-                self._pw.call('set_PWM_dutycycle', self.gpio_pin, duty, retries=3, timeout=1.0)
+                self._safe_pigpio_call('set_PWM_dutycycle', self.gpio_pin, duty, retries=3, timeout=1.0)
         except Exception as e:
             self._notify_bg(f"Output error: {str(e)}", type_='negative')
             try:
                 self.disarm_system()
-            except Exception:
-                pass
+            except Exception as ex:
+                self._log_error("disarm_system after arm error", ex)
             return
 
         self._notify_bg("SYSTEM ARMED", type_='warning')
@@ -839,24 +1015,18 @@ class ESCTestStand:
                 # dalej transmitujemy 0 (ciągłość ramek)
                 try:
                     self._dshot_tx.set_throttle(0)
-                except Exception:
-                    pass
+                except Exception as e:
+                    self._log_error("DShot set_throttle(0) on disarm", e)
             elif self._protocol == 'PWM50':
                 try:
-                    self._pw.call('set_servo_pulsewidth', self.gpio_pin, 0, timeout=1.0)
-                except Exception:
-                    try:
-                        self.pi.set_servo_pulsewidth(self.gpio_pin, 0)
-                    except Exception:
-                        pass
+                    self._safe_pigpio_call('set_servo_pulsewidth', self.gpio_pin, 0, timeout=1.0)
+                except Exception as e:
+                    self._log_error("SERVO 0 on disarm", e)
             else:
                 try:
-                    self._pw.call('set_PWM_dutycycle', self.gpio_pin, 0, timeout=1.0)
-                except Exception:
-                    try:
-                        self.pi.set_PWM_dutycycle(self.gpio_pin, 0)
-                    except Exception:
-                        pass
+                    self._safe_pigpio_call('set_PWM_dutycycle', self.gpio_pin, 0, timeout=1.0)
+                except Exception as e:
+                    self._log_error("PWM 0 on disarm", e)
         except Exception as e:
             self._notify_bg(f"Output error: {str(e)}", type_='negative')
 
@@ -941,20 +1111,14 @@ class ESCTestStand:
                     self._dshot_tx.set_throttle(0)
                 elif proto == 'PWM50':
                     try:
-                        self._pw.call('set_servo_pulsewidth', self.gpio_pin, 0, timeout=1.0)
-                    except Exception:
-                        try:
-                            self.pi.set_servo_pulsewidth(self.gpio_pin, 0)
-                        except Exception:
-                            pass
+                        self._safe_pigpio_call('set_servo_pulsewidth', self.gpio_pin, 0, timeout=1.0)
+                    except Exception as e:
+                        self._log_error("SERVO 0 on hard stop", e)
                 else:
                     try:
-                        self._pw.call('set_PWM_dutycycle', self.gpio_pin, 0, timeout=1.0)
-                    except Exception:
-                        try:
-                            self.pi.set_PWM_dutycycle(self.gpio_pin, 0)
-                        except Exception:
-                            pass
+                        self._safe_pigpio_call('set_PWM_dutycycle', self.gpio_pin, 0, timeout=1.0)
+                    except Exception as e:
+                        self._log_error("PWM 0 on hard stop", e)
             except Exception as e:
                 self._notify_bg(f"Output error: {str(e)}", type_='negative')
 

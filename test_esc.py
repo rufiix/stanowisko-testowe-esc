@@ -2,8 +2,10 @@ import time
 import random
 import threading
 import logging
+import queue
 from collections import deque
-from typing import Optional
+from typing import Optional, Any
+from concurrent.futures import Future, CancelledError, InvalidStateError
 
 import pigpio
 from nicegui import ui, app
@@ -35,37 +37,144 @@ DSHOT0_LOW_US = DSHOT_BIT_TOTAL_US - DSHOT0_HIGH_US  # 2 us
 DSHOT_FRAME_GAP_US = max(10, 1000 - 16 * DSHOT_BIT_TOTAL_US)
 DSHOT_MIN_THROTTLE = 48   # <48 to komendy; >=48 to gaz
 DSHOT_MAX_THROTTLE = 2047
-DSHOT_DEFAULT_IDLE = 0    # BEZPIECZNIE: brak obrotów po ARM
+DSHOT_DEFAULT_IDLE = DSHOT_MIN_THROTTLE  # bezpieczny idle (nie komendy)
+
+# DShot: bezpieczne opóźnienie przed kasowaniem poprzedniej fali
+DSHOT_WAVE_DELETE_DELAY_S = 0.02  # 20 ms
+
+# Finishing: maksymalny czas rampy do idle (asekuracyjnie)
+FINISHING_MAX_S = 3.0
+
+
+# -------------------- PIGPIO WORKER --------------------
+class PigpioWorker:
+    """Wątek do seriowania wszystkich wywołań pigpio (thread-safe).
+       call(): synchronicznie z timeoutem; submit(): asynchronicznie (Future).
+       Reentrancy: call() w wątku worker'a wykonuje inline (bez kolejki)."""
+
+    def __init__(self, pi: pigpio.pi, name: str = 'pigpio-worker'):
+        self.pi = pi
+        self._q: "queue.Queue[Optional[tuple]]" = queue.Queue()
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(target=self._loop, daemon=True, name=name)
+        self._thread.start()
+
+    def _loop(self):
+        while not self._stop_event.is_set():
+            try:
+                item = self._q.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if item is None:
+                break
+            func_desc, args, kwargs, retries, retry_delay, future = item
+            if future.cancelled():
+                continue
+            try:
+                res = self._execute(func_desc, args, kwargs, retries, retry_delay)
+                try:
+                    future.set_result(res)
+                except (InvalidStateError, CancelledError):
+                    pass
+            except Exception as e:
+                try:
+                    future.set_exception(e)
+                except (InvalidStateError, CancelledError):
+                    pass
+
+    def _execute(self, func_desc: Any, args: tuple, kwargs: dict, retries: int, retry_delay: float):
+        last_exc = None
+        for attempt in range(retries):
+            if not self.pi.connected:
+                raise ConnectionError("pigpio disconnected")
+            try:
+                if isinstance(func_desc, str):
+                    fn = getattr(self.pi, func_desc)
+                    return fn(*args, **kwargs)
+                elif callable(func_desc):
+                    return func_desc(self.pi, *args, **kwargs)
+                else:
+                    raise ValueError("Invalid func descriptor for PigpioWorker.call")
+            except AttributeError as e:
+                last_exc = e
+                if attempt >= retries - 1:
+                    raise
+                time.sleep(retry_delay)
+            except Exception as e:
+                last_exc = e
+                if attempt >= retries - 1:
+                    raise
+                time.sleep(retry_delay)
+        if last_exc:
+            raise last_exc
+
+    def call(self, func: Any, *args, retries: int = 3, retry_delay: float = 0.02, timeout: Optional[float] = 5.0, **kwargs):
+        if self._stop_event.is_set():
+            raise RuntimeError("PigpioWorker is stopped")
+        if threading.get_ident() == getattr(self._thread, 'ident', None):
+            return self._execute(func, args, kwargs, retries, retry_delay)
+
+        fut: Future = Future()
+        self._q.put((func, args, kwargs, retries, retry_delay, fut))
+        try:
+            return fut.result(timeout=timeout)
+        except Exception:
+            try:
+                fut.cancel()
+            except Exception:
+                pass
+            raise
+
+    def submit(self, func: Any, *args, retries: int = 3, retry_delay: float = 0.02, **kwargs) -> Future:
+        if self._stop_event.is_set():
+            raise RuntimeError("PigpioWorker is stopped")
+        fut: Future = Future()
+        self._q.put((func, args, kwargs, retries, retry_delay, fut))
+        return fut
+
+    def stop(self):
+        self._stop_event.set()
+        self._q.put(None)
+        self._thread.join(timeout=2.0)
+
+    @property
+    def connected(self) -> bool:
+        return bool(self.pi.connected) and (not self._stop_event.is_set())
+
 
 # -------------------- DSHOT TX --------------------
 class DShotTransmitter:
-    """Nadajnik DShot oparty o pigpio wave z bezpiecznym przełączaniem fal."""
-    def __init__(self, pi: pigpio.pi, gpio: int):
-        self.pi = pi
+    """Nadajnik DShot oparty o pigpio wave z bezpiecznym przełączaniem i kasowaniem (via PigpioWorker)."""
+    def __init__(self, worker: PigpioWorker, gpio: int):
+        self.worker = worker
         self.gpio = gpio
         self._current_wid: Optional[int] = None
         self._last_throttle: Optional[int] = None
         self._lock = threading.Lock()
+        self._tx_lock = threading.Lock()  # serializacja wave*
         self._pending_delete = deque()  # (wid, safe_after_time)
+        self._pending_ids = set()       # deduplikacja WID w kolejce
+        self._req_counter = 0
 
     @staticmethod
     def _make_packet(throttle: int, telemetry: int = 0) -> int:
         t = max(0, min(2047, int(throttle)))
-        payload = ((t << 1) | (telemetry & 0x1)) & 0x0FFF  # 12 bitów
+        payload = ((t << 1) | (telemetry & 0x1)) & 0x0FFF
         csum = 0
         for i in range(3):
             csum ^= (payload >> (i * 4)) & 0xF
         csum &= 0xF
-        return (payload << 4) | csum  # 16-bitowy pakiet
+        return (payload << 4) | csum
 
     def _build_wave(self, throttle: int) -> int:
+        if not self.worker.connected:
+            raise ConnectionError("pigpio disconnected")
         packet = self._make_packet(throttle, telemetry=0)
 
         pulses = []
         on_mask = 1 << self.gpio
         off_mask = on_mask
 
-        # MSB -> LSB, 16 bitów
         for i in range(15, -1, -1):
             bit = (packet >> i) & 1
             if bit:
@@ -74,83 +183,138 @@ class DShotTransmitter:
             else:
                 pulses.append(pigpio.pulse(on_mask, 0, DSHOT0_HIGH_US))
                 pulses.append(pigpio.pulse(0, off_mask, DSHOT0_LOW_US))
-
-        # przerwa między ramkami (linia niska)
         pulses.append(pigpio.pulse(0, off_mask, DSHOT_FRAME_GAP_US))
 
-        # Poprawnie: wave_add_new przygotowuje bufor pulsów do nowej fali (nie kasuje istniejących WID)
-        self.pi.wave_add_new()
-        self.pi.wave_add_generic(pulses)
-        wid = self.pi.wave_create()
+        self.worker.call('wave_add_new', timeout=1.0)
+        self.worker.call('wave_add_generic', pulses, timeout=1.0)
+        wid = self.worker.call('wave_create', timeout=1.0)
         if wid < 0:
             raise RuntimeError("pigpio wave_create failed")
         return wid
 
-    def _process_pending_deletes(self):
-        """Kasuje opóźnione wave'y po upływie safe_after_time."""
-        now = time.time()
-        while self._pending_delete and self._pending_delete[0][1] <= now:
-            wid, _ = self._pending_delete.popleft()
-            try:
-                self.pi.wave_delete(wid)
-            except Exception:
-                pass
+    def _get_tx_at(self) -> int:
+        try:
+            return int(self.worker.call('wave_tx_at', timeout=1.0))
+        except AttributeError:
+            return -999
+        except Exception:
+            return -999
 
-    def set_throttle(self, throttle: int):
-        """Ustawia i powtarza falę dla danej wartości; bezpiecznie przełącza z poprzedniej."""
-        throttle = max(0, min(DSHOT_MAX_THROTTLE, int(throttle)))
-        with self._lock:
-            if throttle == self._last_throttle and self._current_wid is not None:
-                self._process_pending_deletes()
+    def _process_pending_deletes(self):
+        with self._tx_lock:
+            now = time.time()
+            to_delete = []
+            with self._lock:
+                while self._pending_delete and self._pending_delete[0][1] <= now:
+                    wid, _ = self._pending_delete.popleft()
+                    to_delete.append(wid)
+
+            if not to_delete:
                 return
 
-            new_wid = self._build_wave(throttle)
-            old_wid = self._current_wid
+            tx_at = self._get_tx_at()
+            requeue = []
+            for wid in to_delete:
+                if wid == tx_at:
+                    requeue.append(wid)
+                else:
+                    try:
+                        self.worker.call('wave_delete', wid, timeout=1.0)
+                    except Exception:
+                        pass
+                    finally:
+                        with self._lock:
+                            self._pending_ids.discard(wid)
 
-            # Start powtarzania nowej fali (preferuj tryb SYNC jeśli dostępny)
-            wave_send_using_mode = getattr(self.pi, 'wave_send_using_mode', None)
-            if callable(wave_send_using_mode):
-                mode = getattr(pigpio, 'WAVE_MODE_REPEAT_SYNC', 3)
-                self.pi.wave_send_using_mode(new_wid, mode)
-            else:
-                self.pi.wave_send_repeat(new_wid)
+            if requeue:
+                with self._lock:
+                    for wid in requeue:
+                        if wid not in self._pending_ids:
+                            self._pending_ids.add(wid)
+                        self._pending_delete.append((wid, time.time() + DSHOT_WAVE_DELETE_DELAY_S))
 
-            # Bezpieczne, opóźnione kasowanie starej fali
-            if old_wid is not None:
-                self._pending_delete.append((old_wid, time.time() + 0.005))  # ok. 5 ramek DShot
+    def set_throttle(self, throttle: int):
+        throttle = max(0, min(DSHOT_MAX_THROTTLE, int(throttle)))
 
-            self._current_wid = new_wid
-            self._last_throttle = throttle
+        with self._tx_lock:
+            with self._lock:
+                if throttle == self._last_throttle and self._current_wid is not None:
+                    return
+                self._req_counter += 1
+                req_id = self._req_counter
+                prev_wid = self._current_wid
+                self._last_throttle = throttle
 
-            # Sprzątanie zaległych
-            self._process_pending_deletes()
+            new_wid = None
+            try:
+                new_wid = self._build_wave(throttle)
+
+                with self._lock:
+                    stale = (req_id != self._req_counter) or (self._last_throttle != throttle)
+
+                if stale:
+                    try:
+                        self.worker.call('wave_delete', new_wid, timeout=1.0)
+                    except Exception:
+                        pass
+                    return
+
+                try:
+                    mode = getattr(pigpio, 'WAVE_MODE_REPEAT_SYNC', 3)
+                    self.worker.call('wave_send_using_mode', new_wid, mode, timeout=1.0)
+                except AttributeError:
+                    self.worker.call('wave_send_repeat', new_wid, timeout=1.0)
+
+                with self._lock:
+                    current_now = self._current_wid
+                    self._current_wid = new_wid
+                    if prev_wid is not None and prev_wid == current_now:
+                        if prev_wid not in self._pending_ids:
+                            self._pending_ids.add(prev_wid)
+                            self._pending_delete.append((prev_wid, time.time() + DSHOT_WAVE_DELETE_DELAY_S))
+
+            except Exception:
+                if new_wid is not None:
+                    try:
+                        self.worker.call('wave_delete', new_wid, timeout=1.0)
+                    except Exception:
+                        pass
+                raise
+
+        self._process_pending_deletes()
 
     def stop(self):
-        with self._lock:
+        with self._tx_lock:
             try:
-                self.pi.wave_tx_stop()
+                self.worker.call('wave_tx_stop', timeout=1.0)
             except Exception:
                 pass
-            if self._current_wid is not None:
-                try:
-                    self.pi.wave_delete(self._current_wid)
-                except Exception:
-                    pass
+
+            with self._lock:
+                wids = list(self._pending_ids)
+                if self._current_wid is not None:
+                    wids.append(self._current_wid)
+                self._pending_delete.clear()
+                self._pending_ids.clear()
                 self._current_wid = None
-            while self._pending_delete:
-                wid, _ = self._pending_delete.popleft()
+                self._last_throttle = None
+
+            for wid in wids:
                 try:
-                    self.pi.wave_delete(wid)
+                    self.worker.call('wave_delete', wid, timeout=1.0)
                 except Exception:
                     pass
             try:
-                self.pi.wave_clear()
+                self.worker.call('wave_clear', timeout=1.0)
             except Exception:
                 pass
-            self._last_throttle = None
+
 
 # -------------------- POMOCNICZE --------------------
 def ramp(current: float, target: float, up_rate: float, down_rate: float, dt: float) -> float:
+    # Bezpieczeństwo: nie pozwól na 0/ujemne
+    up_rate = max(1e-6, float(up_rate))
+    down_rate = max(1e-6, float(down_rate))
     if current < target:
         return min(current + up_rate * dt, target)
     else:
@@ -158,6 +322,11 @@ def ramp(current: float, target: float, up_rate: float, down_rate: float, dt: fl
 
 def target_when_close(current: float, target: float, min_v: float, max_v: float, eps: float = 2.0) -> float:
     return random.uniform(min_v, max_v) if abs(current - target) < eps else target
+
+def fmt_mmss(seconds: float) -> str:
+    s = int(max(0.0, float(seconds)))  # bez zaokrągleń do 60
+    return f"{s//60:02d}:{s%60:02d}"
+
 
 # -------------------- LOGIKA --------------------
 class ESCTestStand:
@@ -185,21 +354,33 @@ class ESCTestStand:
         self._protocol = 'PWM490'  # 'PWM50' | 'PWM490' | 'DSHOT300'
         self._pwm_frequency = PWM_FREQUENCY
         self._pwm_range = PWM_RANGE
-        self._pu = 1_000_000 / self._pwm_frequency  # okres w µs
+        self._pu = 1_000_000 / self._pwm_frequency  # okres w µs dla PWM490
 
         # Stany bieżące
-        self._current_pwm = 0.0
+        self._current_pwm = 0.0         # µs (dla PWM50 i PWM490 używamy µs jako abstrakcji)
         self._target_pwm = 0.0
         self._current_dshot = 0.0
         self._target_dshot = 0.0
+
         self._end_time = 0.0
+        self._start_time = 0.0
         self._time_left_at_pause = 0.0
+
         self._finishing = False
+        self._finishing_deadline = 0.0
+        self._auto_finish = False
+        self._stopping_soft = False
         self._last_update_time = time.time()
+
+        # Snapshoty do UI
+        self._progress_snapshot = 0.0
+        self._elapsed_snapshot = 0.0
+        self._time_left_snapshot = float(self.duration_seconds)
 
         # Synchronizacja
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
+        self._wake_event = threading.Event()
         self._pause_event = threading.Event()
         self._running_event = threading.Event()
         self._armed = False
@@ -210,25 +391,39 @@ class ESCTestStand:
         # pigpio
         self.pi = pigpio.pi()
         if not self.pi.connected:
-            self.pi.stop()
+            try:
+                self.pi.stop()
+            except Exception:
+                pass
             raise IOError("pigpio daemon not running! Uruchom: sudo pigpiod -s 1")
 
-        # Ostrzeżenie o -s 1 (nie ma prostego sprawdzenia z API)
+        # Worker do pigpio
+        self._pw = PigpioWorker(self.pi)
+
         self._notify_bg("Upewnij się, że pigpiod działa z -s 1 (1µs) dla DShot.", 'warning')
 
         try:
-            self.pi.set_mode(self.gpio_pin, pigpio.OUTPUT)
-            self.pi.set_PWM_frequency(self.gpio_pin, self._pwm_frequency)
-            self.pi.set_PWM_range(self.gpio_pin, self._pwm_range)
+            self._pw.call('set_mode', self.gpio_pin, pigpio.OUTPUT, timeout=1.0)
+            # Inicjalnie ustawiamy PWM490 parametry, bo taki jest domyślny protokół
+            r1 = self._pw.call('set_PWM_frequency', self.gpio_pin, self._pwm_frequency, timeout=1.0)
+            r2 = self._pw.call('set_PWM_range', self.gpio_pin, self._pwm_range, timeout=1.0)
+            if isinstance(r1, int) and r1 < 0:
+                raise RuntimeError(f"set_PWM_frequency failed: {r1}")
+            if isinstance(r2, int) and r2 < 0:
+                raise RuntimeError(f"set_PWM_range failed: {r2}")
         except Exception as err:
-            self.pi.stop()
+            self._pw.stop()
+            try:
+                self.pi.stop()
+            except Exception:
+                pass
             raise IOError(f"pigpio initialization error: {err}")
 
         # Nadajnik DShot
-        self._dshot_tx = DShotTransmitter(self.pi, self.gpio_pin)
+        self._dshot_tx = DShotTransmitter(self._pw, self.gpio_pin)
 
         # Wątek sterujący
-        self._pwm_thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._pwm_thread = threading.Thread(target=self._run_loop, daemon=True, name='esc-run-loop')
         self._pwm_thread.start()
 
     # ---------- Powiadomienia ----------
@@ -250,24 +445,62 @@ class ESCTestStand:
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.cleanup()
 
+    def _handle_pigpio_error(self, e: Exception):
+        self._notify_bg(f"pigpio error: {e}", 'negative')
+        try:
+            self.disarm_system()
+        except Exception:
+            pass
+
     def cleanup(self):
         self._stop_event.set()
-        self._pwm_thread.join(timeout=1.0)
+        self._wake_event.set()
+        self._pwm_thread.join(timeout=2.0)
         if self._pwm_thread.is_alive():
             print("Warning: PWM thread did not terminate properly")
+
         try:
             self._dshot_tx.stop()
         except Exception:
             pass
-        if self.pi.connected:
-            try:
-                if self._protocol == 'DSHOT300':
-                    self.pi.write(self.gpio_pin, 0)
-                else:
-                    self.pi.set_PWM_dutycycle(self.gpio_pin, 0)
+
+        try:
+            if self._protocol == 'DSHOT300':
+                try:
+                    self._pw.call('write', self.gpio_pin, 0, timeout=1.0)
+                except Exception:
+                    try:
+                        self.pi.write(self.gpio_pin, 0)
+                    except Exception:
+                        pass
+            elif self._protocol == 'PWM50':
+                try:
+                    self._pw.call('set_servo_pulsewidth', self.gpio_pin, 0, timeout=1.0)
+                except Exception:
+                    try:
+                        self.pi.set_servo_pulsewidth(self.gpio_pin, 0)
+                    except Exception:
+                        pass
+            else:
+                try:
+                    self._pw.call('set_PWM_dutycycle', self.gpio_pin, 0, timeout=1.0)
+                except Exception:
+                    try:
+                        self.pi.set_PWM_dutycycle(self.gpio_pin, 0)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        try:
+            self._pw.stop()
+        except Exception:
+            pass
+        try:
+            if self.pi.connected:
                 self.pi.stop()
-            except Exception:
-                pass
+        except Exception:
+            pass
 
     # ---------- Protokół ----------
     @property
@@ -276,7 +509,7 @@ class ESCTestStand:
 
     @property
     def can_change_protocol(self) -> bool:
-        return (not self._armed) and (not self.is_running)
+        return (not self._armed) and (not self.is_running) and (not self._finishing)
 
     @property
     def pwm50_button_enabled(self) -> bool:
@@ -291,7 +524,7 @@ class ESCTestStand:
         return self.can_change_protocol and self._protocol != 'DSHOT300'
 
     def set_protocol(self, protocol: str):
-        if self._armed or self.is_running:
+        if self._armed or self.is_running or self._finishing:
             ui.notify("Zmiana protokołu możliwa tylko, gdy DISARMED i TEST STOPPED", type='negative')
             return
 
@@ -301,30 +534,58 @@ class ESCTestStand:
                 return
 
             if protocol == 'DSHOT300':
+                # Spróbuj wyłączyć PWM/servo na wszelki wypadek
+                try:
+                    self._pw.call('set_PWM_dutycycle', self.gpio_pin, 0, timeout=1.0)
+                except Exception:
+                    pass
+                try:
+                    self._pw.call('set_servo_pulsewidth', self.gpio_pin, 0, timeout=1.0)
+                except Exception:
+                    pass
                 self._protocol = 'DSHOT300'
                 ui.notify("Protokół: DShot300 (UWAGA: wymagane pigpiod -s 1)", type='info')
-            elif protocol in ('PWM50', 'PWM490'):
-                freq = 50 if protocol == 'PWM50' else 490
+
+            elif protocol == 'PWM50':
+                # Zatrzymaj PWM i włącz tryb servo
                 try:
-                    self.pi.set_PWM_frequency(self.gpio_pin, freq)
-                    self.pi.set_PWM_range(self.gpio_pin, self._pwm_range)
+                    self._pw.call('set_PWM_dutycycle', self.gpio_pin, 0, timeout=1.0)
+                except Exception:
+                    pass
+                self._protocol = 'PWM50'
+                ui.notify("Protokół: PWM 50Hz (servo pulses)", type='info')
+
+            elif protocol == 'PWM490':
+                # Wyłącz servo i włącz PWM490
+                try:
+                    self._pw.call('set_servo_pulsewidth', self.gpio_pin, 0, timeout=1.0)
+                except Exception:
+                    pass
+                freq = 490
+                try:
+                    r1 = self._pw.call('set_PWM_frequency', self.gpio_pin, freq, timeout=1.0)
+                    r2 = self._pw.call('set_PWM_range', self.gpio_pin, self._pwm_range, timeout=1.0)
+                    if isinstance(r1, int) and r1 < 0:
+                        raise RuntimeError(f"set_PWM_frequency failed: {r1}")
+                    if isinstance(r2, int) and r2 < 0:
+                        raise RuntimeError(f"set_PWM_range failed: {r2}")
                 except Exception as err:
                     ui.notify(f"Frequency error: {err}", type='negative')
                     return
-
                 self._pwm_frequency = freq
                 self._pu = 1_000_000 / freq
-                self._protocol = protocol
-                ui.notify(f"Protokół: PWM {freq}Hz", type='info')
+                self._protocol = 'PWM490'
+                ui.notify("Protokół: PWM 490Hz", type='info')
             else:
                 ui.notify("Nieobsługiwany protokół", type='negative')
+
+        self._wake_event.set()
 
     # ---------- Pętla sterująca ----------
     def _run_loop(self):
         while not self._stop_event.is_set():
             loop_start = time.time()
 
-            # Jeden lock dla całej logiki decyzyjnej
             with self._lock:
                 now = time.time()
                 dt = now - self._last_update_time
@@ -335,87 +596,176 @@ class ESCTestStand:
                 armed = self._armed
                 proto = self._protocol
 
-                # Decyzje i aktualizacja stanów
-                if running and not paused:
-                    if now >= self._end_time and not self._finishing:
-                        self._finishing = True
-                        if proto == 'DSHOT300':
-                            self._target_dshot = float(self.dshot_idle)
-                        else:
-                            self._target_pwm = float(self.idle_pwm)
+                # Domyślne wyjście
+                out = ('NOOP', None)
 
+                if self._finishing:
+                    # Rampa do idle (niezależna od RUNNING/PAUSE)
                     if proto == 'DSHOT300':
-                        self._target_dshot = target_when_close(
-                            self._current_dshot, self._target_dshot,
-                            self.dshot_min, self.dshot_max
-                        )
+                        target = float(max(DSHOT_MIN_THROTTLE, min(DSHOT_MAX_THROTTLE, self.dshot_idle)))
+                        self._target_dshot = target
                         self._current_dshot = ramp(
-                            self._current_dshot, self._target_dshot,
+                            self._current_dshot, target,
                             self.dshot_ramp_up_per_s, self.dshot_ramp_down_per_s, dt
                         )
-                        if self._finishing and abs(self._current_dshot - self.dshot_idle) < 1.0:
-                            self._running_event.clear()
-                            self._pause_event.clear()
-                            self._finishing = False
-                            self._end_time = 0.0
-                            self._time_left_at_pause = 0.0
-                    else:
-                        self._target_pwm = target_when_close(
-                            self._current_pwm, self._target_pwm,
-                            self.min_pwm, self.max_pwm
-                        )
+                        out = ('DSHOT', int(max(0, min(DSHOT_MAX_THROTTLE, round(self._current_dshot)))))
+                    elif proto == 'PWM50':
+                        target = float(self.idle_pwm)
+                        self._target_pwm = target
                         self._current_pwm = ramp(
-                            self._current_pwm, self._target_pwm,
+                            self._current_pwm, target,
                             self.ramp_up_per_s, self.ramp_down_per_s, dt
                         )
-                        if self._finishing and abs(self._current_pwm - self.idle_pwm) < 1.0:
-                            self._running_event.clear()
-                            self._pause_event.clear()
-                            self._finishing = False
-                            self._end_time = 0.0
-                            self._time_left_at_pause = 0.0
+                        out = ('SERVO', int(self._current_pwm))
+                    else:  # PWM490
+                        target = float(self.idle_pwm)
+                        self._target_pwm = target
+                        self._current_pwm = ramp(
+                            self._current_pwm, target,
+                            self.ramp_up_per_s, self.ramp_down_per_s, dt
+                        )
+                        duty = int((self._current_pwm / self._pu) * self._pwm_range)
+                        duty = max(0, min(self._pwm_range, duty))
+                        out = ('PWM', duty)
+
+                    # Kryteria zakończenia FINISHING
+                    close_enough = (abs((self._current_dshot if proto == 'DSHOT300' else self._current_pwm) - target) < 1.0)
+                    timeout_reached = (now >= self._finishing_deadline) if self._finishing_deadline > 0 else False
+                    if close_enough or timeout_reached:
+                        self._finishing = False
+                        self._auto_finish = False
+                        self._stopping_soft = False
+                        self._finishing_deadline = 0.0
+                        self._time_left_at_pause = 0.0
+
+                elif running and not paused:
+                    # Sprawdź KONIEC CZASU: natychmiast przejdź do FINISHING i policz rampę już teraz
+                    if now >= self._end_time:
+                        self._running_event.clear()
+                        self._finishing = True
+                        self._auto_finish = True
+                        self._stopping_soft = False
+                        self._finishing_deadline = now + FINISHING_MAX_S
+                        self._progress_snapshot = 1.0
+                        self._elapsed_snapshot = float(self.duration_seconds)
+                        self._time_left_snapshot = 0.0
+
+                        if proto == 'DSHOT300':
+                            target = float(max(DSHOT_MIN_THROTTLE, min(DSHOT_MAX_THROTTLE, self.dshot_idle)))
+                            self._target_dshot = target
+                            self._current_dshot = ramp(
+                                self._current_dshot, target,
+                                self.dshot_ramp_up_per_s, self.dshot_ramp_down_per_s, dt
+                            )
+                            out = ('DSHOT', int(max(0, min(DSHOT_MAX_THROTTLE, round(self._current_dshot)))))
+                        elif proto == 'PWM50':
+                            target = float(self.idle_pwm)
+                            self._target_pwm = target
+                            self._current_pwm = ramp(
+                                self._current_pwm, target,
+                                self.ramp_up_per_s, self.ramp_down_per_s, dt
+                            )
+                            out = ('SERVO', int(self._current_pwm))
+                        else:
+                            target = float(self.idle_pwm)
+                            self._target_pwm = target
+                            self._current_pwm = ramp(
+                                self._current_pwm, target,
+                                self.ramp_up_per_s, self.ramp_down_per_s, dt
+                            )
+                            duty = int((self._current_pwm / self._pu) * self._pwm_range)
+                            duty = max(0, min(self._pwm_range, duty))
+                            out = ('PWM', duty)
+
+                    else:
+                        # Normalny bieg testu
+                        if proto == 'DSHOT300':
+                            self._target_dshot = target_when_close(
+                                self._current_dshot, self._target_dshot,
+                                self.dshot_min, self.dshot_max
+                            )
+                            self._current_dshot = ramp(
+                                self._current_dshot, self._target_dshot,
+                                self.dshot_ramp_up_per_s, self.dshot_ramp_down_per_s, dt
+                            )
+                            out = ('DSHOT', int(max(0, min(DSHOT_MAX_THROTTLE, round(self._current_dshot)))))
+                        elif proto == 'PWM50':
+                            self._target_pwm = target_when_close(
+                                self._current_pwm, self._target_pwm,
+                                self.min_pwm, self.max_pwm
+                            )
+                            self._current_pwm = ramp(
+                                self._current_pwm, self._target_pwm,
+                                self.ramp_up_per_s, self.ramp_down_per_s, dt
+                            )
+                            out = ('SERVO', int(self._current_pwm))
+                        else:  # PWM490
+                            self._target_pwm = target_when_close(
+                                self._current_pwm, self._target_pwm,
+                                self.min_pwm, self.max_pwm
+                            )
+                            self._current_pwm = ramp(
+                                self._current_pwm, self._target_pwm,
+                                self.ramp_up_per_s, self.ramp_down_per_s, dt
+                            )
+                            duty = int((self._current_pwm / self._pu) * self._pwm_range)
+                            duty = max(0, min(self._pwm_range, duty))
+                            out = ('PWM', duty)
+
+                        # snapshoty dla UI
+                        if self.duration_seconds > 0:
+                            elapsed = min(self.duration_seconds, max(0.0, now - self._start_time))
+                            self._elapsed_snapshot = elapsed
+                            self._progress_snapshot = min(1.0, elapsed / self.duration_seconds)
+                            self._time_left_snapshot = max(0.0, self._end_time - now)
 
                 elif armed:
+                    # idle
                     if proto == 'DSHOT300':
-                        self._current_dshot = float(self.dshot_idle)
-                        self._target_dshot = float(self.dshot_idle)
+                        self._current_dshot = float(max(DSHOT_MIN_THROTTLE, min(DSHOT_MAX_THROTTLE, self.dshot_idle)))
+                        self._target_dshot = self._current_dshot
+                        out = ('DSHOT', int(self._current_dshot))
+                    elif proto == 'PWM50':
+                        self._current_pwm = float(self.idle_pwm)
+                        self._target_pwm = float(self.idle_pwm)
+                        out = ('SERVO', int(self._current_pwm))
                     else:
                         self._current_pwm = float(self.idle_pwm)
                         self._target_pwm = float(self.idle_pwm)
+                        duty = int((self._current_pwm / self._pu) * self._pwm_range)
+                        duty = max(0, min(self._pwm_range, duty))
+                        out = ('PWM', duty)
                 else:
+                    # DISARMED: nie wysyłamy nic (unikamy ożywiania DShot przy 0)
                     self._current_pwm = 0.0
                     self._target_pwm = 0.0
                     self._current_dshot = 0.0
                     self._target_dshot = 0.0
+                    out = ('NOOP', None)
 
-                # Przygotowanie wyjścia (poza lockiem)
-                if proto == 'DSHOT300':
-                    out = ('DSHOT', int(max(0, min(DSHOT_MAX_THROTTLE, round(self._current_dshot)))))
-                else:
-                    duty = int((self._current_pwm / self._pu) * self._pwm_range)
-                    duty = max(0, min(self._pwm_range, duty))
-                    out = ('PWM', duty)
-
-            # Wyślij sygnał (poza lockiem)
+            # Wyślij sygnał
             try:
+                if not self._pw.connected:
+                    raise ConnectionError("pigpio disconnected")
                 if out[0] == 'DSHOT':
                     self._dshot_tx.set_throttle(out[1])
+                elif out[0] == 'SERVO':
+                    self._pw.call('set_servo_pulsewidth', self.gpio_pin, int(out[1]), retries=3, timeout=1.0)
+                elif out[0] == 'PWM':
+                    self._pw.call('set_PWM_dutycycle', self.gpio_pin, out[1], retries=3, timeout=1.0)
                 else:
-                    self.pi.set_PWM_dutycycle(self.gpio_pin, out[1])
+                    pass  # NOOP
             except Exception as e:
-                self._notify_bg(f"Output error: {str(e)}", 'negative')
-                with self._lock:
-                    armed_now = self._armed
-                if armed_now:
-                    # Rozbrajamy bezpiecznie (z powiadomieniem w kolejce)
-                    self.disarm_system()
+                self._handle_pigpio_error(e)
 
-            # Tempo pętli
+            # Tempo pętli z natychmiastowym wybudzaniem
             elapsed = time.time() - loop_start
             if out[0] == 'DSHOT':
-                time.sleep(max(0, 0.001 - elapsed))  # ~1 kHz
+                timeout = max(0.0, 0.001 - elapsed)  # ~1 kHz
             else:
-                time.sleep(max(0, 0.02 - elapsed))   # ~50 Hz
+                timeout = max(0.0, 0.01 - elapsed)   # ~100 Hz
+            self._wake_event.wait(timeout=timeout)
+            self._wake_event.clear()
 
     # ---------- Sterowanie testem ----------
     def arm_system(self):
@@ -424,10 +774,17 @@ class ESCTestStand:
             self._running_event.clear()
             self._time_left_at_pause = 0.0
             self._finishing = False
+            self._auto_finish = False
+            self._stopping_soft = False
+            self._finishing_deadline = 0.0
             self._armed = True
+            self._progress_snapshot = 0.0
+            self._elapsed_snapshot = 0.0
+            self._time_left_snapshot = float(self.duration_seconds)
+
             if self._protocol == 'DSHOT300':
-                self._current_dshot = float(self.dshot_idle)
-                self._target_dshot = float(self.dshot_idle)
+                self._current_dshot = float(max(DSHOT_MIN_THROTTLE, min(DSHOT_MAX_THROTTLE, self.dshot_idle)))
+                self._target_dshot = self._current_dshot
             else:
                 self._current_pwm = float(self.idle_pwm)
                 self._target_pwm = float(self.idle_pwm)
@@ -435,16 +792,22 @@ class ESCTestStand:
 
         try:
             if self._protocol == 'DSHOT300':
-                self._dshot_tx.set_throttle(int(self.dshot_idle))
+                self._dshot_tx.set_throttle(int(self._current_dshot))
+            elif self._protocol == 'PWM50':
+                self._pw.call('set_servo_pulsewidth', self.gpio_pin, int(self.idle_pwm), retries=3, timeout=1.0)
             else:
                 duty = int((self.idle_pwm / self._pu) * self._pwm_range)
-                self.pi.set_PWM_dutycycle(self.gpio_pin, duty)
+                self._pw.call('set_PWM_dutycycle', self.gpio_pin, duty, retries=3, timeout=1.0)
         except Exception as e:
             self._notify_bg(f"Output error: {str(e)}", type_='negative')
-            self.disarm_system()
+            try:
+                self.disarm_system()
+            except Exception:
+                pass
             return
 
         self._notify_bg("SYSTEM ARMED", type_='warning')
+        self._wake_event.set()
 
     def disarm_system(self):
         with self._lock:
@@ -452,35 +815,65 @@ class ESCTestStand:
             self._running_event.clear()
             self._time_left_at_pause = 0.0
             self._finishing = False
+            self._auto_finish = False
+            self._stopping_soft = False
+            self._finishing_deadline = 0.0
             self._armed = False
-            # Reset wszystkich stanów
+            # Reset stanów
             self._current_pwm = 0.0
             self._target_pwm = 0.0
             self._current_dshot = 0.0
             self._target_dshot = 0.0
             self._end_time = 0.0
+            self._start_time = 0.0
             self._last_update_time = time.time()
+            self._progress_snapshot = 0.0
+            self._elapsed_snapshot = 0.0
+            self._time_left_snapshot = float(self.duration_seconds)
 
         try:
             if self._protocol == 'DSHOT300':
                 self._dshot_tx.stop()
-                self.pi.write(self.gpio_pin, 0)
+                try:
+                    self._pw.call('write', self.gpio_pin, 0, timeout=1.0)
+                except Exception:
+                    try:
+                        self.pi.write(self.gpio_pin, 0)
+                    except Exception:
+                        pass
+            elif self._protocol == 'PWM50':
+                try:
+                    self._pw.call('set_servo_pulsewidth', self.gpio_pin, 0, timeout=1.0)
+                except Exception:
+                    try:
+                        self.pi.set_servo_pulsewidth(self.gpio_pin, 0)
+                    except Exception:
+                        pass
             else:
-                self.pi.set_PWM_dutycycle(self.gpio_pin, 0)
+                try:
+                    self._pw.call('set_PWM_dutycycle', self.gpio_pin, 0, timeout=1.0)
+                except Exception:
+                    try:
+                        self.pi.set_PWM_dutycycle(self.gpio_pin, 0)
+                    except Exception:
+                        pass
         except Exception as e:
             self._notify_bg(f"Output error: {str(e)}", type_='negative')
 
         self._notify_bg("SYSTEM DISARMED", type_='positive')
+        self._wake_event.set()
 
     def start_test(self):
         with self._lock:
-            if not self._armed or self._running_event.is_set():
+            if not self._armed or self._running_event.is_set() or self._finishing:
                 return
 
             if self._protocol == 'DSHOT300':
                 if self.dshot_min >= self.dshot_max:
                     self._notify_bg("DShot: MIN musi być < MAX", type_='negative')
                     return
+                # Upewnij się, że idle jest poprawny
+                self.dshot_idle = int(max(DSHOT_MIN_THROTTLE, min(DSHOT_MAX_THROTTLE, self.dshot_idle)))
             else:
                 if self.min_pwm >= self.max_pwm:
                     self._notify_bg("PWM: MIN musi być < MAX", type_='negative')
@@ -490,29 +883,41 @@ class ESCTestStand:
             self._running_event.set()
             self._pause_event.clear()
             self._finishing = False
+            self._auto_finish = False
+            self._stopping_soft = False
+            self._finishing_deadline = 0.0
+            self._start_time = now
             self._end_time = now + self.duration_seconds
             self._time_left_at_pause = 0.0
+            self._progress_snapshot = 0.0
+            self._elapsed_snapshot = 0.0
+            self._time_left_snapshot = float(self.duration_seconds)
             self._last_update_time = now
 
             if self._protocol == 'DSHOT300':
                 self._target_dshot = random.uniform(self.dshot_min, self.dshot_max)
+            elif self._protocol == 'PWM50':
+                self._target_pwm = random.uniform(self.min_pwm, self.max_pwm)
             else:
                 self._target_pwm = random.uniform(self.min_pwm, self.max_pwm)
 
         self._notify_bg("TEST STARTED", type_='positive')
+        self._wake_event.set()
 
     def stop_test(self, notify: bool = True, hard: bool = False):
-        was_dshot = False
         with self._lock:
-            if not self._running_event.is_set():
-                return
+            proto = self._protocol
+            running_now = self._running_event.is_set()
+            finishing_now = self._finishing
 
             if hard:
-                was_dshot = (self._protocol == 'DSHOT300')
+                # Natychmiast
                 self._running_event.clear()
                 self._pause_event.clear()
                 self._finishing = False
-                # PEŁNY RESET STANÓW
+                self._auto_finish = False
+                self._stopping_soft = False
+                self._finishing_deadline = 0.0
                 self._current_pwm = 0.0
                 self._target_pwm = 0.0
                 self._current_dshot = 0.0
@@ -521,50 +926,85 @@ class ESCTestStand:
                 self._time_left_at_pause = 0.0
                 self._last_update_time = time.time()
             else:
-                # miękki stop: ramp do idle
-                self._pause_event.clear()
-                self._finishing = True
-                if self._protocol == 'DSHOT300':
-                    self._target_dshot = float(self.dshot_idle)
-                else:
-                    self._target_pwm = float(self.idle_pwm)
+                if not finishing_now:
+                    # Miękki STOP: natychmiast zatrzymaj RUNNING (UI zamraża progress)
+                    self._running_event.clear()
+                    self._pause_event.clear()
+                    self._stopping_soft = True
+                    self._finishing = True
+                    self._auto_finish = False
+                    self._finishing_deadline = time.time() + FINISHING_MAX_S
+                    if proto == 'DSHOT300':
+                        self._target_dshot = float(max(DSHOT_MIN_THROTTLE, min(DSHOT_MAX_THROTTLE, self.dshot_idle)))
+                    else:
+                        self._target_pwm = float(self.idle_pwm)
 
-        # Natychmiastowe odcięcie sprzętowe dla HARD STOP
+        # Sprzęt dla HARD STOP poza lockiem
         if hard:
             try:
-                if was_dshot:
+                if proto == 'DSHOT300':
                     self._dshot_tx.stop()
-                    self.pi.write(self.gpio_pin, 0)
+                    try:
+                        self._pw.call('write', self.gpio_pin, 0, timeout=1.0)
+                    except Exception:
+                        try:
+                            self.pi.write(self.gpio_pin, 0)
+                        except Exception:
+                            pass
+                elif proto == 'PWM50':
+                    try:
+                        self._pw.call('set_servo_pulsewidth', self.gpio_pin, 0, timeout=1.0)
+                    except Exception:
+                        try:
+                            self.pi.set_servo_pulsewidth(self.gpio_pin, 0)
+                        except Exception:
+                            pass
                 else:
-                    self.pi.set_PWM_dutycycle(self.gpio_pin, 0)
+                    try:
+                        self._pw.call('set_PWM_dutycycle', self.gpio_pin, 0, timeout=1.0)
+                    except Exception:
+                        try:
+                            self.pi.set_PWM_dutycycle(self.gpio_pin, 0)
+                        except Exception:
+                            pass
             except Exception as e:
                 self._notify_bg(f"Output error: {str(e)}", type_='negative')
 
         if notify:
-            self._notify_bg("TEST STOPPED" + (" (HARD)" if hard else " (SMOOTH)"), type_='info')
+            if hard:
+                self._notify_bg("TEST STOPPED (HARD)", type_='info')
+            else:
+                if running_now and not finishing_now:
+                    self._notify_bg("TEST STOPPED (SMOOTH)", type_='info')
+                elif finishing_now:
+                    self._notify_bg("Already stopping…", type_='warning')
+
+        self._wake_event.set()
 
     def toggle_pause(self):
         with self._lock:
-            if not self._running_event.is_set():
-                return
-            if self._finishing:
-                # Nie pozwalamy pauzować w trakcie FINISHING
-                self._notify_bg("Nie można PAUSE/RESUME w trakcie FINISHING", type_='warning')
+            if not self._running_event.is_set() or self._finishing:
+                self._notify_bg("Nie można PAUSE/RESUME (brak RUN lub trwa FINISHING)", type_='warning')
                 return
 
+            now = time.time()
             if self._pause_event.is_set():
                 # RESUME
                 self._pause_event.clear()
-                self._end_time = time.time() + self._time_left_at_pause
-                self._last_update_time = time.time()
+                self._end_time = now + self._time_left_at_pause
+                # Stabilnie wznowienie: elapsed od snapshotu
+                self._start_time = now - self._elapsed_snapshot
+                self._last_update_time = now
                 msg = "TEST RESUMED"
             else:
-                # PAUSE
+                # PAUSE: zamroź time_left na snapshot
                 self._pause_event.set()
-                self._time_left_at_pause = max(0.0, self._end_time - time.time())
+                self._time_left_at_pause = max(0.0, self._end_time - now)
+                self._time_left_snapshot = self._time_left_at_pause
                 msg = "TEST PAUSED"
 
         self._notify_bg(msg, type_='info')
+        self._wake_event.set()
 
     # ---------- Właściwości / pomocnicze ----------
     @property
@@ -584,46 +1024,55 @@ class ESCTestStand:
         return self._pause_event.is_set()
 
     @property
+    def is_finishing(self) -> bool:
+        return self._finishing
+
+    @property
     def can_start(self) -> bool:
-        return self._armed and not self._running_event.is_set()
+        return self._armed and (not self._running_event.is_set()) and (not self._finishing)
+
+    @property
+    def can_emergency_stop(self) -> bool:
+        return self._running_event.is_set() or self._finishing
 
     @property
     def status_text(self) -> str:
         if not self._armed:
             return "DISARMED"
-        if self.is_paused:
-            return f"PAUSED | Time left: {int(self.time_left)}s"
         if self._finishing:
             return "FINISHING (ramp to idle)"
+        if self.is_paused:
+            return f"PAUSED | Time left: {fmt_mmss(self.time_left)}"
         if self.is_running:
-            return f"RUNNING | Time left: {int(self.time_left)}s"
+            return f"RUNNING | Time left: {fmt_mmss(self.time_left)}"
         if self._protocol == 'DSHOT300':
-            return f"ARMED (IDLE: {int(self.dshot_idle)} [DShot])"
+            return f"ARMED (IDLE: {int(max(DSHOT_MIN_THROTTLE, min(DSHOT_MAX_THROTTLE, self.dshot_idle)))} [DShot])"
         return f"ARMED (IDLE: {self.idle_pwm}µs)"
 
     @property
     def time_left(self) -> float:
-        if not self.is_running:
-            return float(self.duration_seconds)
+        if self.is_running and not self.is_paused:
+            return max(0.0, self._end_time - time.time())
         if self.is_paused:
             return self._time_left_at_pause
         if self._finishing:
-            return 0.0
-        return max(0.0, self._end_time - time.time())
+            # zamrożone
+            return self._time_left_snapshot
+        return float(self.duration_seconds)
+
+    @property
+    def time_left_text(self) -> str:
+        if self._finishing:
+            return "Stopping…"
+        return fmt_mmss(self.time_left)
 
     @property
     def elapsed_time(self) -> float:
-        if not self.is_running:
-            return 0.0
-        return self.duration_seconds - self.time_left
+        return float(self._elapsed_snapshot)
 
     @property
     def progress(self) -> float:
-        if not self.is_running or self.duration_seconds <= 0:
-            return 0.0
-        if self._finishing:
-            return 1.0
-        return min(1.0, self.elapsed_time / self.duration_seconds)
+        return float(self._progress_snapshot)
 
     @property
     def current_value(self) -> str:
@@ -649,17 +1098,14 @@ def create_controls_section():
         ui.label('STATUS').classes('text-h5')
         ui.label().classes('text-xl').bind_text_from(esc_test_stand, 'status_text')
 
-        # Aktualny protokół
         ui.label().classes('text-subtitle2 text-grey-7').bind_text_from(
             esc_test_stand, 'protocol', lambda p: f"Protocol: {p}"
         )
 
-        # Aktualna wartość (PWM lub DShot)
         ui.label().classes('text-lg font-mono').bind_text_from(
             esc_test_stand, 'current_value'
         )
 
-        # Czas i progres
         time_label = ui.label().classes('text-lg')
         progress_label = ui.label().classes('absolute-center text-black text-bold text-h6')
 
@@ -670,17 +1116,13 @@ def create_controls_section():
             pass
 
         def update_display():
-            # Powiadomienia z wątku sterującego
             for msg, t in esc_test_stand.pop_notifications():
                 ui.notify(msg, type=t)
 
-            t_left = esc_test_stand.time_left
-            time_label.set_text(
-                f"Time remaining: {int(t_left//60):02d}:{int(t_left%60):02d}"
-            )
-            elapsed = esc_test_stand.elapsed_time if esc_test_stand.is_running else 0
+            time_label.set_text(f"Time: {esc_test_stand.time_left_text}")
+            elapsed = esc_test_stand.elapsed_time
             progress_label.set_text(
-                f"{esc_test_stand.current_value} | Elapsed: {int(elapsed//60):02d}:{int(elapsed%60):02d}"
+                f"{esc_test_stand.current_value} | Elapsed: {fmt_mmss(elapsed)}"
             )
 
         ui.timer(0.1, update_display)
@@ -689,7 +1131,6 @@ def create_buttons_section():
     ui.separator().classes('q-my-md')
 
     with ui.row().classes('w-full justify-around items-center'):
-        # Arm/Disarm
         ui.button('ARM', on_click=esc_test_stand.arm_system, color='warning') \
             .props('icon=lock_open') \
             .bind_enabled_from(esc_test_stand, 'is_armed', backward=lambda a: not a)
@@ -698,7 +1139,6 @@ def create_buttons_section():
             .props('icon=lock') \
             .bind_enabled_from(esc_test_stand, 'is_armed')
 
-        # Start/Pause/Stop
         ui.button('START', on_click=esc_test_stand.start_test, color='negative') \
             .props('icon=play_arrow') \
             .bind_enabled_from(esc_test_stand, 'can_start')
@@ -707,17 +1147,14 @@ def create_buttons_section():
             .props('icon=pause') \
             .bind_enabled_from(esc_test_stand, 'is_running')
 
-        # Smooth stop
         ui.button('STOP', on_click=esc_test_stand.stop_test, color='negative') \
             .props('icon=stop') \
             .bind_enabled_from(esc_test_stand, 'is_running')
 
-        # Hard stop (awaryjny)
         ui.button('EMERGENCY STOP', on_click=lambda: esc_test_stand.stop_test(hard=True), color='negative') \
             .props('icon=bolt') \
-            .bind_enabled_from(esc_test_stand, 'is_running')
+            .bind_enabled_from(esc_test_stand, 'can_emergency_stop')
 
-        # Wybór protokołu
         ui.button('PWM 50Hz', on_click=lambda: esc_test_stand.set_protocol('PWM50'), color='primary') \
             .bind_enabled_from(esc_test_stand, 'pwm50_button_enabled')
 
@@ -742,7 +1179,6 @@ def create_settings_section():
     with ui.card().classes('w-full max-w-2xl mx-auto q-mt-md'):
         ui.label('SETTINGS').classes('text-h5')
 
-        # Walidacja zakresów w UI
         def ensure_pwm_min(val):
             try:
                 v = int(val)
@@ -779,97 +1215,60 @@ def create_settings_section():
                 esc_test_stand.dshot_max = min(DSHOT_MAX_THROTTLE, esc_test_stand.dshot_min + 1)
                 ui.notify('DShot MAX musi być > MIN; skorygowano.', type='warning')
 
-        # Globalny czas trwania testu
-        ui.number('TEST DURATION (s)',
-                  min=1,
-                  max=86400,
-                  step=1) \
+        ui.number('TEST DURATION (s)', min=1, max=86400, step=1) \
             .bind_value(esc_test_stand, 'duration_seconds') \
             .bind_enabled_from(esc_test_stand, 'is_running', backward=lambda r: not r)
 
-        # Zakładki: PWM vs DShot
         with ui.tabs() as tabs:
             pwm_tab = ui.tab('PWM Settings')
             dshot_tab = ui.tab('DShot Settings')
 
         with ui.tab_panels(tabs, value=pwm_tab):
-            # PWM
             with ui.tab_panel(pwm_tab):
                 with ui.grid(columns=2).classes('w-full gap-4'):
-                    ui.number('IDLE PWM (µs)',
-                              min=MIN_PWM_LIMIT,
-                              max=MAX_PWM_LIMIT,
-                              step=1) \
+                    ui.number('IDLE PWM (µs)', min=MIN_PWM_LIMIT, max=MAX_PWM_LIMIT, step=1) \
                         .bind_value(esc_test_stand, 'idle_pwm') \
                         .bind_enabled_from(esc_test_stand, 'is_armed', backward=lambda a: not a)
 
-                    ui.number('MIN PWM (µs)',
-                              min=MIN_PWM_LIMIT,
-                              max=MAX_PWM_LIMIT,
-                              step=10,
+                    ui.number('MIN PWM (µs)', min=MIN_PWM_LIMIT, max=MAX_PWM_LIMIT, step=10,
                               on_change=lambda e: ensure_pwm_min(e.value)) \
                         .bind_value(esc_test_stand, 'min_pwm') \
                         .bind_enabled_from(esc_test_stand, 'is_running', backward=lambda r: not r)
 
-                    ui.number('MAX PWM (µs)',
-                              min=MIN_PWM_LIMIT,
-                              max=MAX_PWM_LIMIT,
-                              step=10,
+                    ui.number('MAX PWM (µs)', min=MIN_PWM_LIMIT, max=MAX_PWM_LIMIT, step=10,
                               on_change=lambda e: ensure_pwm_max(e.value)) \
                         .bind_value(esc_test_stand, 'max_pwm') \
                         .bind_enabled_from(esc_test_stand, 'is_running', backward=lambda r: not r)
 
-                    ui.number('RAMP UP RATE (µs/s)',
-                              min=1,
-                              max=1_000_000,
-                              step=100) \
+                    ui.number('RAMP UP RATE (µs/s)', min=1, max=1_000_000, step=100) \
                         .bind_value(esc_test_stand, 'ramp_up_per_s') \
                         .bind_enabled_from(esc_test_stand, 'is_running', backward=lambda r: not r)
 
-                    ui.number('RAMP DOWN RATE (µs/s)',
-                              min=1,
-                              max=1_000_000,
-                              step=100) \
+                    ui.number('RAMP DOWN RATE (µs/s)', min=1, max=1_000_000, step=100) \
                         .bind_value(esc_test_stand, 'ramp_down_per_s') \
                         .bind_enabled_from(esc_test_stand, 'is_running', backward=lambda r: not r)
 
-            # DShot
             with ui.tab_panel(dshot_tab):
                 with ui.grid(columns=2).classes('w-full gap-4'):
-                    ui.number('IDLE THROTTLE',
-                              min=0,  # pozwalamy na 0 dla pełnego stopu
-                              max=DSHOT_MAX_THROTTLE,
-                              step=1) \
+                    ui.number('IDLE THROTTLE', min=DSHOT_MIN_THROTTLE, max=DSHOT_MAX_THROTTLE, step=1) \
                         .bind_value(esc_test_stand, 'dshot_idle') \
                         .bind_enabled_from(esc_test_stand, 'is_armed', backward=lambda a: not a)
 
-                    ui.number('MIN THROTTLE',
-                              min=DSHOT_MIN_THROTTLE,
-                              max=DSHOT_MAX_THROTTLE,
-                              step=10,
+                    ui.number('MIN THROTTLE', min=DSHOT_MIN_THROTTLE, max=DSHOT_MAX_THROTTLE, step=10,
                               on_change=lambda e: ensure_dshot_min(e.value)) \
                         .bind_value(esc_test_stand, 'dshot_min') \
                         .bind_enabled_from(esc_test_stand, 'is_running', backward=lambda r: not r)
 
-                    ui.number('MAX THROTTLE',
-                              min=DSHOT_MIN_THROTTLE,
-                              max=DSHOT_MAX_THROTTLE,
-                              step=10,
+                    ui.number('MAX THROTTLE', min=DSHOT_MIN_THROTTLE, max=DSHOT_MAX_THROTTLE, step=10,
                               on_change=lambda e: ensure_dshot_max(e.value)) \
                         .bind_value(esc_test_stand, 'dshot_max') \
                         .bind_enabled_from(esc_test_stand, 'is_running', backward=lambda r: not r)
 
-                    ui.number('RAMP UP (units/s)',
-                              min=1,
-                              max=5000,
-                              step=50) \
+                    ui.number('RAMP UP (units/s)', min=1, max=5000, step=50) \
                         .bind_value(esc_test_stand, 'dshot_ramp_up_per_s') \
                         .bind_enabled_from(esc_test_stand, 'is_running', backward=lambda r: not r)
 
-                    ui.number('RAMP DOWN (units/s)',
-                              min=1,
-                              max=5000,
-                              step=50) \
+                    ui.number('RAMP DOWN (units/s)', min=1, max=5000, step=50) \
                         .bind_value(esc_test_stand, 'dshot_ramp_down_per_s') \
                         .bind_enabled_from(esc_test_stand, 'is_running', backward=lambda r: not r)
 

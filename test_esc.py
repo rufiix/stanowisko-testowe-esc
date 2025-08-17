@@ -26,15 +26,7 @@ DEFAULT_DURATION = 60
 MIN_PWM_LIMIT = 900
 MAX_PWM_LIMIT = 2500
 
-# DShot300 (cyfrowy)
-# Bit time ≈ 3.33 µs, ale używamy 3 µs (integer µs) => wymagane pigpiod -s 1
-DSHOT_BIT_TOTAL_US = 3
-DSHOT1_HIGH_US = 2
-DSHOT1_LOW_US = DSHOT_BIT_TOTAL_US - DSHOT1_HIGH_US  # 1 us
-DSHOT0_HIGH_US = 1
-DSHOT0_LOW_US = DSHOT_BIT_TOTAL_US - DSHOT0_HIGH_US  # 2 us
-# ~1 kHz ramek: 16 bitów * 3us = 48us => gap ≈ 952us
-DSHOT_FRAME_GAP_US = max(10, 1000 - 16 * DSHOT_BIT_TOTAL_US)
+# DShot (cyfrowy): limity wartości
 DSHOT_MIN_THROTTLE = 48   # <48 to komendy; >=48 to gaz
 DSHOT_MAX_THROTTLE = 2047
 DSHOT_DEFAULT_IDLE = DSHOT_MIN_THROTTLE  # bezpieczny idle (nie komendy)
@@ -157,11 +149,14 @@ class PigpioWorker:
 
 # -------------------- DSHOT TX --------------------
 class DShotTransmitter:
-    """Nadajnik DShot oparty o pigpio wave z bezpiecznym przełączaniem i kasowaniem (via PigpioWorker)."""
+    """Nadajnik DShot oparty o pigpio wave z bezpiecznym przełączaniem i kasowaniem (via PigpioWorker).
+       Bit time konfigurowalny (3 µs lub 4 µs; wymagane pigpiod -s 1 dla sensownej pracy)."""
 
     MAX_PENDING_DELETES = 100  # Limit kolejki oczekujących usunięć
 
-    def __init__(self, worker: PigpioWorker, gpio: int):
+    def __init__(self, worker: PigpioWorker, gpio: int, bit_time_us: int = 3):
+        if gpio >= 32:
+            raise ValueError("DShot via pigpio wave wspiera GPIO 0-31 (bank 0). Użyj pinu < 32.")
         self.worker = worker
         self.gpio = gpio
         self._current_wid: Optional[int] = None
@@ -171,6 +166,33 @@ class DShotTransmitter:
         self._pending_delete = deque()  # (wid, safe_after_time)
         self._pending_ids = set()       # deduplikacja WID w kolejce
         self._req_counter = 0
+
+        # Timing DShot
+        self._tbit_us = 3
+        self._h1 = 2
+        self._l1 = 1
+        self._h0 = 1
+        self._l0 = 2
+        self._gap_us = 1000 - 16 * self._tbit_us  # ok. 1 kHz
+        self.set_bit_time_us(bit_time_us)
+
+    def set_bit_time_us(self, bit_us: int):
+        """Ustaw czas bitu DShot (µs). Zalecane 3 µs. 4 µs bywa akceptowalne."""
+        with self._tx_lock:
+            bit_us = int(max(1, min(10, bit_us)))
+            self._tbit_us = bit_us
+            # 1 ≈ 1/3-1/2 całego bitu wysoko
+            if bit_us == 3:
+                self._h1, self._l1 = 2, 1
+                self._h0, self._l0 = 1, 2
+            elif bit_us == 4:
+                self._h1, self._l1 = 3, 1
+                self._h0, self._l0 = 1, 3
+            else:
+                # fallback: proporcje 2/3 i 1/3
+                self._h1, self._l1 = max(1, bit_us * 2 // 3), max(1, bit_us - max(1, bit_us * 2 // 3))
+                self._h0, self._l0 = max(1, bit_us // 3), max(1, bit_us - max(1, bit_us // 3))
+            self._gap_us = max(10, 1000 - 16 * self._tbit_us)
 
     @staticmethod
     def _make_packet(throttle: int, telemetry: int = 0) -> int:
@@ -230,6 +252,14 @@ class DShotTransmitter:
             except Exception:
                 pass
 
+    def _create_wave_atomic(self, pulses):
+        """Funkcja wykonywana w wątku worker, atomowo dodająca i tworząca falę."""
+        def _inner(pi: pigpio.pi, pulses_):
+            pi.wave_add_new()
+            pi.wave_add_generic(pulses_)
+            return pi.wave_create()
+        return self.worker.call(_inner, pulses, timeout=2.0)
+
     def _build_wave(self, throttle: int) -> int:
         if not self.worker.connected:
             raise ConnectionError("pigpio disconnected")
@@ -240,17 +270,19 @@ class DShotTransmitter:
         on_mask = 1 << self.gpio
         off_mask = on_mask
 
+        h1, l1, h0, l0, gap_us = self._h1, self._l1, self._h0, self._l0, self._gap_us
+
         # MSB -> LSB
         for i in range(15, -1, -1):
             bit = (packet >> i) & 1
             if bit:
-                pulses.append(pigpio.pulse(on_mask, 0, DSHOT1_HIGH_US))
-                pulses.append(pigpio.pulse(0, off_mask, DSHOT1_LOW_US))
+                pulses.append(pigpio.pulse(on_mask, 0, h1))
+                pulses.append(pigpio.pulse(0, off_mask, l1))
             else:
-                pulses.append(pigpio.pulse(on_mask, 0, DSHOT0_HIGH_US))
-                pulses.append(pigpio.pulse(0, off_mask, DSHOT0_LOW_US))
-        # przerwa między ramkami
-        pulses.append(pigpio.pulse(0, off_mask, DSHOT_FRAME_GAP_US))
+                pulses.append(pigpio.pulse(on_mask, 0, h0))
+                pulses.append(pigpio.pulse(0, off_mask, l0))
+        # przerwa między ramkami (≈ 1 kHz)
+        pulses.append(pigpio.pulse(0, off_mask, gap_us))
 
         # Sprawdź zasoby i ewentualnie posprzątaj stare fale
         try:
@@ -264,16 +296,12 @@ class DShotTransmitter:
         except Exception:
             pass
 
-        self.worker.call('wave_add_new', timeout=1.0)
-        self.worker.call('wave_add_generic', pulses, timeout=1.0)
-        wid = self.worker.call('wave_create', timeout=1.0)
-        if wid < 0:
+        wid = self._create_wave_atomic(pulses)
+        if not isinstance(wid, int) or wid < 0:
             # Zamiast wave_clear() — sprzątnij nieaktywne fale i spróbuj ponownie
             self._emergency_cleanup()
-            self.worker.call('wave_add_new', timeout=1.0)
-            self.worker.call('wave_add_generic', pulses, timeout=1.0)
-            wid = self.worker.call('wave_create', timeout=1.0)
-            if wid < 0:
+            wid = self._create_wave_atomic(pulses)
+            if not isinstance(wid, int) or wid < 0:
                 raise RuntimeError(f"pigpio wave_create failed after cleanup: {wid}")
         return wid
 
@@ -322,7 +350,6 @@ class DShotTransmitter:
         throttle = max(0, min(DSHOT_MAX_THROTTLE, int(throttle)))
 
         with self._tx_lock:
-            # Trzymaj locki w przewidywalnym scope
             with self._lock:
                 if throttle == self._last_throttle and self._current_wid is not None:
                     return
@@ -335,17 +362,14 @@ class DShotTransmitter:
             try:
                 new_wid = self._build_wave(throttle)
 
-                # Sprawdź aktualność w tym samym scope locka
                 with self._lock:
                     if req_id != self._req_counter or self._last_throttle != throttle:
-                        # Stary request — usuń nową falę asynchronicznie
                         try:
                             self.worker.submit('wave_delete', new_wid, retries=1)
                         except Exception:
                             pass
                         return
 
-                    # Wszystko OK — ustaw jako bieżącą falę
                     self._current_wid = new_wid
 
                 # Wyślij falę (po ustawieniu _current_wid)
@@ -357,13 +381,20 @@ class DShotTransmitter:
 
                 # Zaplanuj usunięcie poprzedniej i ogranicz rozmiar kolejki pending_delete
                 with self._lock:
+                    now = time.time()
+                    # Staraj się usuwać tylko te, które są bezpieczne
                     while len(self._pending_delete) > self.MAX_PENDING_DELETES:
-                        oldest_wid, _ = self._pending_delete.popleft()
-                        self._pending_ids.discard(oldest_wid)
-                        try:
-                            self.worker.call('wave_delete', oldest_wid, timeout=0.1)
-                        except Exception:
-                            pass
+                        oldest_wid, safe_time = self._pending_delete[0]
+                        tx_at = self._get_tx_at()
+                        if (safe_time <= now) and (oldest_wid != tx_at) and (oldest_wid != self._current_wid):
+                            self._pending_delete.popleft()
+                            self._pending_ids.discard(oldest_wid)
+                            try:
+                                self.worker.call('wave_delete', oldest_wid, timeout=0.2)
+                            except Exception:
+                                pass
+                        else:
+                            break
 
                     if prev_wid is not None and prev_wid not in self._pending_ids:
                         self._pending_ids.add(prev_wid)
@@ -431,13 +462,13 @@ class ESCTestStand:
     def __init__(self, gpio_pin: int):
         self.gpio_pin = gpio_pin
 
-        # Logger dla błędów
+        # Logger
         self._logger = logging.getLogger('ESCTestStand')
         self._logger.setLevel(logging.INFO)
         if not self._logger.handlers:
-            fh = logging.FileHandler('esc_test_errors.log')
-            fh.setLevel(logging.ERROR)
-            formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+            fh = logging.FileHandler('esc_test.log')
+            fh.setLevel(logging.INFO)
+            formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
             fh.setFormatter(formatter)
             self._logger.addHandler(fh)
 
@@ -457,9 +488,10 @@ class ESCTestStand:
         self.dshot_max = 1200
         self.dshot_ramp_up_per_s = 500
         self.dshot_ramp_down_per_s = 800
+        self.dshot_bit_us = 3  # 3 µs zalecane (aproksymacja DShot300)
 
         # Protokół i parametry PWM
-        self._protocol = 'PWM490'  # 'PWM50' | 'PWM490' | 'DSHOT300'
+        self._protocol = 'PWM490'  # 'PWM50' | 'PWM490' | 'DSHOT300' (UI: "DShot")
         self._pwm_frequency = PWM_FREQUENCY
         self._pwm_range = PWM_RANGE
         self._pu = 1_000_000 / self._pwm_frequency  # okres w µs dla PWM490
@@ -470,15 +502,16 @@ class ESCTestStand:
         self._current_dshot = 0.0
         self._target_dshot = 0.0
 
-        self._end_time = 0.0
-        self._start_time = 0.0
-        self._time_left_at_pause = 0.0
+        # Czas (monotoniczny, odporny na zmiany zegara)
+        self._end_time_mono = 0.0
+        self._start_time_mono = 0.0
+        self._time_left_at_pause_mono = 0.0
 
         self._finishing = False
-        self._finishing_deadline = 0.0
+        self._finishing_deadline_mono = 0.0
         self._auto_finish = False
         self._stopping_soft = False
-        self._last_update_time = time.time()
+        self._last_update_mono = time.monotonic()
 
         # Snapshoty do UI
         self._progress_snapshot = 0.0
@@ -527,7 +560,7 @@ class ESCTestStand:
             raise IOError(f"pigpio initialization error: {err}")
 
         # Nadajnik DShot
-        self._dshot_tx = DShotTransmitter(self._pw, self.gpio_pin)
+        self._dshot_tx = DShotTransmitter(self._pw, self.gpio_pin, bit_time_us=self.dshot_bit_us)
 
         # Jeśli domyślny protokół to DSHOT300, wystartuj od razu transmisję 0
         if self._protocol == 'DSHOT300':
@@ -541,6 +574,9 @@ class ESCTestStand:
         self._pwm_thread.start()
 
     # ---------- Logowanie / bezpieczne wywołania ----------
+    def _log_info(self, msg: str):
+        self._logger.info(msg)
+
     def _log_error(self, context: str, error: Exception):
         self._logger.error(f"{context}: {type(error).__name__}: {str(error)}", exc_info=True)
 
@@ -572,6 +608,7 @@ class ESCTestStand:
 
         if was_armed:
             self._notify_bg("PIGPIO DISCONNECTED - EMERGENCY STOP", 'negative')
+            self._log_info("EMERGENCY STOP due to pigpio disconnect")
 
         # Spróbuj ponownego połączenia
         self._attempt_reconnect()
@@ -599,7 +636,7 @@ class ESCTestStand:
                 except Exception as e:
                     self._log_error("old_worker.stop during reconnect", e)
 
-                self._dshot_tx = DShotTransmitter(self._pw, self.gpio_pin)
+                self._dshot_tx = DShotTransmitter(self._pw, self.gpio_pin, bit_time_us=self.dshot_bit_us)
 
                 # Podstawowa re-konfiguracja GPIO
                 try:
@@ -618,6 +655,7 @@ class ESCTestStand:
                     self._log_error("GPIO reconfiguration after reconnect", e)
 
                 self._notify_bg("Reconnected to pigpio", 'positive')
+                self._log_info("Reconnected to pigpio")
             else:
                 self._notify_bg("Failed to reconnect to pigpio", 'negative')
 
@@ -715,7 +753,7 @@ class ESCTestStand:
 
     def set_protocol(self, protocol: str):
         if self._armed or self.is_running or self._finishing:
-            ui.notify("Zmiana protokołu możliwa tylko, gdy DISARMED i TEST STOPPED", type='negative')
+            self._notify_bg("Zmiana protokołu możliwa tylko, gdy DISARMED i TEST STOPPED", 'negative')
             return
 
         protocol = protocol.upper()
@@ -738,12 +776,14 @@ class ESCTestStand:
                 except Exception:
                     pass
                 self._protocol = 'DSHOT300'
-                ui.notify("Protokół: DShot300 (UWAGA: wymagane pigpiod -s 1)", type='info')
+                self._notify_bg("Protokół: DShot (bit=3–4µs; wymaga pigpiod -s 1)", 'info')
                 # WAŻNE: od razu start transmisji z 0
                 try:
+                    self._dshot_tx.set_bit_time_us(self.dshot_bit_us)
                     self._dshot_tx.set_throttle(0)
                 except Exception as e:
                     self._log_error("DShot set_throttle(0) on set_protocol", e)
+                self._log_info("Protocol changed to DSHOT")
 
             elif protocol == 'PWM50':
                 try:
@@ -751,7 +791,8 @@ class ESCTestStand:
                 except Exception:
                     pass
                 self._protocol = 'PWM50'
-                ui.notify("Protokół: PWM 50Hz (servo pulses)", type='info')
+                self._notify_bg("Protokół: PWM 50Hz (servo pulses)", 'info')
+                self._log_info("Protocol changed to PWM50")
 
             elif protocol == 'PWM490':
                 try:
@@ -767,26 +808,41 @@ class ESCTestStand:
                     if isinstance(r2, int) and r2 < 0:
                         raise RuntimeError(f"set_PWM_range failed: {r2}")
                 except Exception as err:
-                    ui.notify(f"Frequency error: {err}", type='negative')
+                    self._notify_bg(f"Frequency error: {err}", 'negative')
                     return
                 self._pwm_frequency = freq
                 self._pu = 1_000_000 / freq
                 self._protocol = 'PWM490'
-                ui.notify("Protokół: PWM 490Hz", type='info')
+                self._notify_bg("Protokół: PWM 490Hz", 'info')
+                self._log_info("Protocol changed to PWM490")
             else:
-                ui.notify("Nieobsługiwany protokół", type='negative')
+                self._notify_bg("Nieobsługiwany protokół", 'negative')
 
         self._wake_event.set()
+
+    def set_dshot_bit_time(self, bit_us: int):
+        """Zmiana czasu bitu DShot w locie (gdy system DISARMED)."""
+        if self._armed or self.is_running or self._finishing:
+            self._notify_bg("Zmiana DShot Bit Time możliwa tylko, gdy DISARMED i TEST STOPPED", 'warning')
+            return
+        bit_us = int(bit_us)
+        self.dshot_bit_us = bit_us
+        try:
+            self._dshot_tx.set_bit_time_us(bit_us)
+        except Exception as e:
+            self._log_error("Failed to set DShot bit time", e)
+        self._notify_bg(f"DShot Bit Time ustawiony na {bit_us} µs", 'info')
+        self._log_info(f"DShot bit time set to {bit_us}us")
 
     # ---------- Pętla sterująca ----------
     def _run_loop(self):
         while not self._stop_event.is_set():
-            loop_start = time.time()
+            loop_start = time.monotonic()
 
             with self._lock:
-                now = time.time()
-                dt = now - self._last_update_time
-                self._last_update_time = now
+                now = time.monotonic()
+                dt = now - self._last_update_mono
+                self._last_update_mono = now
 
                 running = self._running_event.is_set()
                 paused = self._pause_event.is_set()
@@ -823,21 +879,21 @@ class ESCTestStand:
                         out = ('PWM', max(0, min(self._pwm_range, duty)))
 
                     close_enough = (abs((self._current_dshot if proto == 'DSHOT300' else self._current_pwm) - target) < 1.0)
-                    timeout_reached = (now >= self._finishing_deadline) if self._finishing_deadline > 0 else False
+                    timeout_reached = (now >= self._finishing_deadline_mono) if self._finishing_deadline_mono > 0 else False
                     if close_enough or timeout_reached:
                         self._finishing = False
                         self._auto_finish = False
                         self._stopping_soft = False
-                        self._finishing_deadline = 0.0
-                        self._time_left_at_pause = 0.0
+                        self._finishing_deadline_mono = 0.0
+                        self._time_left_at_pause_mono = 0.0
 
                 elif running and not paused:
-                    if now >= self._end_time:
+                    if now >= self._end_time_mono:
                         self._running_event.clear()
                         self._finishing = True
                         self._auto_finish = True
                         self._stopping_soft = False
-                        self._finishing_deadline = now + FINISHING_MAX_S
+                        self._finishing_deadline_mono = now + FINISHING_MAX_S
                         self._progress_snapshot = 1.0
                         self._elapsed_snapshot = float(self.duration_seconds)
                         self._time_left_snapshot = 0.0
@@ -881,10 +937,10 @@ class ESCTestStand:
                             out = ('PWM', max(0, min(self._pwm_range, duty)))
 
                         if self.duration_seconds > 0:
-                            elapsed = min(self.duration_seconds, max(0.0, now - self._start_time))
+                            elapsed = min(self.duration_seconds, max(0.0, now - self._start_time_mono))
                             self._elapsed_snapshot = elapsed
                             self._progress_snapshot = min(1.0, elapsed / self.duration_seconds)
-                            self._time_left_snapshot = max(0.0, self._end_time - now)
+                            self._time_left_snapshot = max(0.0, self._end_time_mono - now)
 
                 elif armed:
                     if proto == 'DSHOT300':
@@ -909,22 +965,23 @@ class ESCTestStand:
                     else:
                         out = ('PWM', 0)
 
-            # Wyślij sygnał
+            # Wyślij sygnał (sprawdź protokół tuż przed IO, by uniknąć rzadkiego „starego” IO po zmianie)
             try:
                 if not self._pw.connected:
                     raise ConnectionError("pigpio disconnected")
-                if out[0] == 'DSHOT':
+                current_proto = self._protocol
+                if out[0] == 'DSHOT' and current_proto == 'DSHOT300':
                     self._dshot_tx.set_throttle(out[1])
-                elif out[0] == 'SERVO':
+                elif out[0] == 'SERVO' and current_proto == 'PWM50':
                     self._safe_pigpio_call('set_servo_pulsewidth', self.gpio_pin, int(out[1]), retries=3, timeout=1.0)
-                else:
+                elif out[0] == 'PWM' and current_proto == 'PWM490':
                     self._safe_pigpio_call('set_PWM_dutycycle', self.gpio_pin, out[1], retries=3, timeout=1.0)
             except Exception as e:
                 self._handle_pigpio_error(e)
 
             # Tempo pętli
-            elapsed = time.time() - loop_start
-            if out[0] == 'DSHOT':
+            elapsed = time.monotonic() - loop_start
+            if self._protocol == 'DSHOT300':
                 timeout = max(0.0, 0.001 - elapsed)  # ~1 kHz
             else:
                 timeout = max(0.0, 0.01 - elapsed)   # ~100 Hz
@@ -936,11 +993,11 @@ class ESCTestStand:
         with self._lock:
             self._pause_event.clear()
             self._running_event.clear()
-            self._time_left_at_pause = 0.0
+            self._time_left_at_pause_mono = 0.0
             self._finishing = False
             self._auto_finish = False
             self._stopping_soft = False
-            self._finishing_deadline = 0.0
+            self._finishing_deadline_mono = 0.0
             self._armed = True
             self._progress_snapshot = 0.0
             self._elapsed_snapshot = 0.0
@@ -953,7 +1010,7 @@ class ESCTestStand:
             else:
                 self._current_pwm = float(self.idle_pwm)
                 self._target_pwm = float(self.idle_pwm)
-            self._last_update_time = time.time()
+            self._last_update_mono = time.monotonic()
 
         try:
             if self._protocol == 'DSHOT300':
@@ -986,33 +1043,33 @@ class ESCTestStand:
             return
 
         self._notify_bg("SYSTEM ARMED", type_='warning')
+        self._log_info("System ARMED")
         self._wake_event.set()
 
     def disarm_system(self):
         with self._lock:
             self._pause_event.clear()
             self._running_event.clear()
-            self._time_left_at_pause = 0.0
+            self._time_left_at_pause_mono = 0.0
             self._finishing = False
             self._auto_finish = False
             self._stopping_soft = False
-            self._finishing_deadline = 0.0
+            self._finishing_deadline_mono = 0.0
             self._armed = False
             # Reset stanów
             self._current_pwm = 0.0
             self._target_pwm = 0.0
             self._current_dshot = 0.0
             self._target_dshot = 0.0
-            self._end_time = 0.0
-            self._start_time = 0.0
-            self._last_update_time = time.time()
+            self._end_time_mono = 0.0
+            self._start_time_mono = 0.0
+            self._last_update_mono = time.monotonic()
             self._progress_snapshot = 0.0
             self._elapsed_snapshot = 0.0
             self._time_left_snapshot = float(self.duration_seconds)
 
         try:
             if self._protocol == 'DSHOT300':
-                # dalej transmitujemy 0 (ciągłość ramek)
                 try:
                     self._dshot_tx.set_throttle(0)
                 except Exception as e:
@@ -1031,6 +1088,7 @@ class ESCTestStand:
             self._notify_bg(f"Output error: {str(e)}", type_='negative')
 
         self._notify_bg("SYSTEM DISARMED", type_='positive')
+        self._log_info("System DISARMED")
         self._wake_event.set()
 
     def start_test(self):
@@ -1048,20 +1106,20 @@ class ESCTestStand:
                     self._notify_bg("PWM: MIN musi być < MAX", type_='negative')
                     return
 
-            now = time.time()
+            now = time.monotonic()
             self._running_event.set()
             self._pause_event.clear()
             self._finishing = False
             self._auto_finish = False
             self._stopping_soft = False
-            self._finishing_deadline = 0.0
-            self._start_time = now
-            self._end_time = now + self.duration_seconds
-            self._time_left_at_pause = 0.0
+            self._finishing_deadline_mono = 0.0
+            self._start_time_mono = now
+            self._end_time_mono = now + self.duration_seconds
+            self._time_left_at_pause_mono = 0.0
             self._progress_snapshot = 0.0
             self._elapsed_snapshot = 0.0
             self._time_left_snapshot = float(self.duration_seconds)
-            self._last_update_time = now
+            self._last_update_mono = now
 
             if self._protocol == 'DSHOT300':
                 self._target_dshot = random.uniform(self.dshot_min, self.dshot_max)
@@ -1069,6 +1127,7 @@ class ESCTestStand:
                 self._target_pwm = random.uniform(self.min_pwm, self.max_pwm)
 
         self._notify_bg("TEST STARTED", type_='positive')
+        self._log_info("Test STARTED")
         self._wake_event.set()
 
     def stop_test(self, notify: bool = True, hard: bool = False):
@@ -1083,14 +1142,14 @@ class ESCTestStand:
                 self._finishing = False
                 self._auto_finish = False
                 self._stopping_soft = False
-                self._finishing_deadline = 0.0
+                self._finishing_deadline_mono = 0.0
                 self._current_pwm = 0.0
                 self._target_pwm = 0.0
                 self._current_dshot = 0.0
                 self._target_dshot = 0.0
-                self._end_time = 0.0
-                self._time_left_at_pause = 0.0
-                self._last_update_time = time.time()
+                self._end_time_mono = 0.0
+                self._time_left_at_pause_mono = 0.0
+                self._last_update_mono = time.monotonic()
             else:
                 if not finishing_now:
                     self._running_event.clear()
@@ -1098,7 +1157,7 @@ class ESCTestStand:
                     self._stopping_soft = True
                     self._finishing = True
                     self._auto_finish = False
-                    self._finishing_deadline = time.time() + FINISHING_MAX_S
+                    self._finishing_deadline_mono = time.monotonic() + FINISHING_MAX_S
                     if proto == 'DSHOT300':
                         self._target_dshot = float(max(DSHOT_MIN_THROTTLE, min(DSHOT_MAX_THROTTLE, self.dshot_idle)))
                     else:
@@ -1107,7 +1166,6 @@ class ESCTestStand:
         if hard:
             try:
                 if proto == 'DSHOT300':
-                    # utrzymujemy transmisję, ustawiamy 0
                     self._dshot_tx.set_throttle(0)
                 elif proto == 'PWM50':
                     try:
@@ -1125,9 +1183,11 @@ class ESCTestStand:
         if notify:
             if hard:
                 self._notify_bg("TEST STOPPED (HARD)", type_='info')
+                self._log_info("Test STOPPED (HARD)")
             else:
                 if running_now and not finishing_now:
                     self._notify_bg("TEST STOPPED (SMOOTH)", type_='info')
+                    self._log_info("Test STOPPED (SMOOTH)")
                 elif finishing_now:
                     self._notify_bg("Already stopping…", type_='warning')
 
@@ -1139,20 +1199,22 @@ class ESCTestStand:
                 self._notify_bg("Nie można PAUSE/RESUME (brak RUN lub trwa FINISHING)", type_='warning')
                 return
 
-            now = time.time()
+            now = time.monotonic()
             if self._pause_event.is_set():
                 # RESUME
                 self._pause_event.clear()
-                self._end_time = now + self._time_left_at_pause
-                self._start_time = now - self._elapsed_snapshot
-                self._last_update_time = now
+                self._end_time_mono = now + self._time_left_at_pause_mono
+                self._start_time_mono = now - self._elapsed_snapshot
+                self._last_update_mono = now
                 msg = "TEST RESUMED"
+                self._log_info("Test RESUMED")
             else:
                 # PAUSE
                 self._pause_event.set()
-                self._time_left_at_pause = max(0.0, self._end_time - now)
-                self._time_left_snapshot = self._time_left_at_pause
+                self._time_left_at_pause_mono = max(0.0, self._end_time_mono - now)
+                self._time_left_snapshot = self._time_left_at_pause_mono
                 msg = "TEST PAUSED"
+                self._log_info("Test PAUSED")
 
         self._notify_bg(msg, type_='info')
         self._wake_event.set()
@@ -1203,9 +1265,9 @@ class ESCTestStand:
     @property
     def time_left(self) -> float:
         if self.is_running and not self.is_paused:
-            return max(0.0, self._end_time - time.time())
+            return max(0.0, self._end_time_mono - time.monotonic())
         if self.is_paused:
-            return self._time_left_at_pause
+            return self._time_left_at_pause_mono
         if self._finishing:
             return self._time_left_snapshot
         return float(self.duration_seconds)
@@ -1249,7 +1311,7 @@ def create_controls_section():
         ui.label().classes('text-xl').bind_text_from(esc_test_stand, 'status_text')
 
         ui.label().classes('text-subtitle2 text-grey-7').bind_text_from(
-            esc_test_stand, 'protocol', lambda p: f"Protocol: {p}"
+            esc_test_stand, 'protocol', lambda p: f"Protocol: {p} (DShot bit={esc_test_stand.dshot_bit_us}µs)"
         )
 
         ui.label().classes('text-lg font-mono').bind_text_from(
@@ -1257,18 +1319,18 @@ def create_controls_section():
         )
 
         time_label = ui.label().classes('text-lg')
-        progress_label = ui.label().classes('absolute-center text-black text-bold text-h6')
 
-        with ui.linear_progress(show_value=False) \
+        # Pasek postępu z nakładką (overlay)
+        with ui.element('div').style('position:relative;width:100%'):
+            ui.linear_progress(show_value=False) \
                 .bind_value_from(esc_test_stand, 'progress') \
-                .style('height:35px;border-radius:8px;position:relative;') \
-                .props('instant-feedback'):
-            pass
+                .style('height:35px;border-radius:8px;') \
+                .props('instant-feedback')
+            progress_label = ui.label().classes('absolute-center text-black text-bold text-h6')
 
         def update_display():
             for msg, t in esc_test_stand.pop_notifications():
                 ui.notify(msg, type=t)
-
             time_label.set_text(f"Time: {esc_test_stand.time_left_text}")
             elapsed = esc_test_stand.elapsed_time
             progress_label.set_text(
@@ -1311,8 +1373,9 @@ def create_buttons_section():
         ui.button('PWM 490Hz', on_click=lambda: esc_test_stand.set_protocol('PWM490'), color='primary') \
             .bind_enabled_from(esc_test_stand, 'pwm490_button_enabled')
 
-        ui.button('DShot300', on_click=lambda: esc_test_stand.set_protocol('DSHOT300'), color='secondary') \
-            .bind_enabled_from(esc_test_stand, 'dshot_button_enabled')
+        ui.button('DShot', on_click=lambda: esc_test_stand.set_protocol('DSHOT300'), color='secondary') \
+            .bind_enabled_from(esc_test_stand, 'dshot_button_enabled') \
+            .tooltip('DShot via pigpio waves (bit 3–4 µs, pigpiod -s 1 required)')
 
         def update_pause_button():
             if esc_test_stand.is_paused:
@@ -1422,13 +1485,20 @@ def create_settings_section():
                         .bind_value(esc_test_stand, 'dshot_ramp_down_per_s') \
                         .bind_enabled_from(esc_test_stand, 'is_running', backward=lambda r: not r)
 
+                    ui.select(
+                        options=[('3 µs (zalecane)', 3), ('4 µs (eksperymentalnie)', 4)],
+                        label='DShot Bit Time'
+                    ).bind_value(esc_test_stand, 'dshot_bit_us') \
+                        .bind_enabled_from(esc_test_stand, 'is_armed', backward=lambda a: not a) \
+                        .on('change', lambda e: esc_test_stand.set_dshot_bit_time(e.value))
+
 @ui.page('/')
 def main_page():
     if init_error:
         ui.label("INITIALIZATION ERROR").classes("text-h4 text-negative text-center w-full")
-        ui.html(f"<p>pigpio error:</p><pre>{init_error}</pre>") \
+        ui.html(f"<p>pigpio error:</p><pre style='white-space:pre-wrap;overflow-wrap:anywhere'>{init_error}</pre>") \
             .classes("text-body1 text-center w-full")
-        ui.label("Upewnij się, że pigpio działa z próbkowaniem 1us: sudo pigpiod -s 1").classes("text-center w-full")
+        ui.label("Upewnij się, że pigpio działa z próbkowaniem 1µs: sudo pigpiod -s 1").classes("text-center w-full")
     else:
         create_controls_section()
         create_buttons_section()
@@ -1440,5 +1510,5 @@ ui.run(
     host='0.0.0.0',
     show=False,
     reload=False,
-    favicon='🚀'
+    favicon=None,  # ustaw plik .ico/.png jeśli chcesz własną ikonę
 )

@@ -761,6 +761,13 @@ class ESCTestStand:
             if protocol == self._protocol:
                 return
 
+            # Jeżeli wychodzimy z DSHOT do PWM — najpierw zatrzymaj aktywną falę
+            if self._protocol == 'DSHOT300' and protocol in ('PWM50', 'PWM490'):
+                try:
+                    self._dshot_tx.stop()  # wave_tx_stop + kasowanie fal
+                except Exception as e:
+                    self._log_error("Failed to stop DShot before switching protocol", e)
+
             if protocol == 'DSHOT300':
                 # Wyłącz poprzednie tryby i ustaw niski poziom na pinie
                 try:
@@ -786,6 +793,7 @@ class ESCTestStand:
                 self._log_info("Protocol changed to DSHOT")
 
             elif protocol == 'PWM50':
+                # Po zatrzymaniu DShot ustaw stan neutralny i przełącz na servo
                 try:
                     self._safe_pigpio_call('set_PWM_dutycycle', self.gpio_pin, 0, timeout=1.0)
                 except Exception:
@@ -795,6 +803,7 @@ class ESCTestStand:
                 self._log_info("Protocol changed to PWM50")
 
             elif protocol == 'PWM490':
+                # Po zatrzymaniu DShot przełącz na PWM 490 Hz
                 try:
                     self._safe_pigpio_call('set_servo_pulsewidth', self.gpio_pin, 0, timeout=1.0)
                 except Exception:

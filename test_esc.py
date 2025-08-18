@@ -175,7 +175,9 @@ class DShotTransmitter:
         self._current_wid: Optional[int] = None
         self._last_throttle: Optional[int] = None
         self._lock = threading.Lock()
-        self._tx_lock = threading.Lock()  # serializacja wave*
+        # POPRAWKA: Użycie RLock zamiast Lock, aby uniknąć zakleszczenia (deadlock)
+        # w metodzie set_throttle(), która wywołuje _process_pending_deletes().
+        self._tx_lock = threading.RLock()  # serializacja wave*
         self._pending_delete = deque()  # (wid, safe_after_time)
         self._pending_ids = set()       # deduplikacja WID w kolejce
         self._req_counter = 0
@@ -403,7 +405,7 @@ class DShotTransmitter:
                         oldest_wid, safe_time = self._pending_delete[0]
                         tx_at = self._get_tx_at()
                         if (safe_time <= now) and (oldest_wid != tx_at) and (oldest_wid != self._current_wid):
-                            self._pending_delete.popleft()  # FIX: poprawiona literówka
+                            self._pending_delete.popleft()
                             self._pending_ids.discard(oldest_wid)
                             try:
                                 self.worker.call('wave_delete', oldest_wid, timeout=0.2)
@@ -438,24 +440,29 @@ class DShotTransmitter:
                 pass
 
             with self._lock:
-                wids = list(self._pending_ids)
+                wids_to_delete = set(self._pending_ids)
                 if self._current_wid is not None:
-                    wids.append(self._current_wid)
+                    wids_to_delete.add(self._current_wid)
+                
                 self._pending_delete.clear()
                 self._pending_ids.clear()
                 self._current_wid = None
                 self._last_throttle = None
                 self._building_wave = False
 
-            for wid in wids:
+            for wid in wids_to_delete:
                 try:
                     self.worker.call('wave_delete', wid, timeout=1.0)
                 except Exception:
                     pass
-            try:
-                self.worker.call('wave_clear', timeout=1.0)
-            except Exception:
-                pass
+            
+            # ULEPSZENIE: Usunięto globalne `wave_clear()`. Metoda teraz kasuje tylko
+            # fale stworzone przez tę instancję, co jest bezpieczniejsze i bardziej
+            # odizolowane.
+            # try:
+            #     self.worker.call('wave_clear', timeout=1.0)
+            # except Exception:
+            #     pass
 
 
 # -------------------- POMOCNICZE --------------------
@@ -549,7 +556,6 @@ class ESCTestStand:
         self._arm_timer: Optional[threading.Timer] = None
         self._loop_hung = False
         self._send_errors = 0
-        self._dshot_stopped_on_disarm = True
 
         # Kolejka powiadomień do UI
         self._ui_notifications = deque()
@@ -1074,14 +1080,10 @@ class ESCTestStand:
                     else:
                         # DISARMED
                         if proto == 'DSHOT300':
-                            # Zatrzymaj transmisję tylko raz po przejściu do DISARMED
-                            if not self._dshot_stopped_on_disarm:
-                                try:
-                                    self._dshot_tx.stop()
-                                    self._dshot_stopped_on_disarm = True
-                                except Exception as e:
-                                    self._log_error("Failed to stop DShot on disarm", e)
-                            out = None  # brak transmisji
+                            # ULEPSZENIE: Uproszczona logika. Transmisja jest zatrzymywana
+                            # jawnie w disarm_system(). Tutaj po prostu nie generujemy
+                            # nowego sygnału (out=None).
+                            out = None
                         elif proto == 'PWM50':
                             out = ('SERVO', 0)
                         else:
@@ -1142,7 +1144,6 @@ class ESCTestStand:
             self._progress_snapshot = 0.0
             self._elapsed_snapshot = 0.0
             self._time_left_snapshot = float(self.duration_seconds)
-            self._dshot_stopped_on_disarm = False  # reset flagi (po DISARM -> ARM)
 
             if self._protocol == 'DSHOT300':
                 # start od 0 (krótko), potem idle
@@ -1216,8 +1217,6 @@ class ESCTestStand:
             self._progress_snapshot = 0.0
             self._elapsed_snapshot = 0.0
             self._time_left_snapshot = float(self.duration_seconds)
-            # Upewnij się, że nie będziemy próbować drugi raz stopować w run_loop
-            self._dshot_stopped_on_disarm = True
 
         try:
             if self._protocol == 'DSHOT300':
@@ -1591,6 +1590,27 @@ def create_settings_section():
     with ui.card().classes('w-full max-w-2xl mx-auto q-mt-md'):
         ui.label('SETTINGS').classes('text-h5')
 
+        # ULEPSZENIE: Dodano funkcje walidujące dla wartości IDLE.
+        def ensure_pwm_idle(val):
+            try:
+                v = int(val)
+                clamped_v = max(MIN_PWM_LIMIT, min(MAX_PWM_LIMIT, v))
+                if v != clamped_v:
+                    esc_test_stand.idle_pwm = clamped_v
+                    ui.notify(f'IDLE PWM skorygowano do {clamped_v}µs', type='warning')
+            except (ValueError, TypeError):
+                return
+        
+        def ensure_dshot_idle(val):
+            try:
+                v = int(val)
+                clamped_v = max(DSHOT_MIN_THROTTLE, min(DSHOT_MAX_THROTTLE, v))
+                if v != clamped_v:
+                    esc_test_stand.dshot_idle = clamped_v
+                    ui.notify(f'DShot IDLE skorygowano do {clamped_v}', type='warning')
+            except (ValueError, TypeError):
+                return
+
         def ensure_pwm_min(val):
             try:
                 v = int(val)
@@ -1638,7 +1658,8 @@ def create_settings_section():
         with ui.tab_panels(tabs, value=pwm_tab):
             with ui.tab_panel(pwm_tab):
                 with ui.grid(columns=2).classes('w-full gap-4'):
-                    ui.number('IDLE PWM (µs)', min=MIN_PWM_LIMIT, max=MAX_PWM_LIMIT, step=1) \
+                    ui.number('IDLE PWM (µs)', min=MIN_PWM_LIMIT, max=MAX_PWM_LIMIT, step=1,
+                              on_change=lambda e: ensure_pwm_idle(e.value)) \
                         .bind_value(esc_test_stand, 'idle_pwm') \
                         .bind_enabled_from(esc_test_stand, 'is_armed', backward=lambda a: not a)
 
@@ -1662,7 +1683,8 @@ def create_settings_section():
 
             with ui.tab_panel(dshot_tab):
                 with ui.grid(columns=2).classes('w-full gap-4'):
-                    ui.number('IDLE THROTTLE', min=DSHOT_MIN_THROTTLE, max=DSHOT_MAX_THROTTLE, step=1) \
+                    ui.number('IDLE THROTTLE', min=DSHOT_MIN_THROTTLE, max=DSHOT_MAX_THROTTLE, step=1,
+                              on_change=lambda e: ensure_dshot_idle(e.value)) \
                         .bind_value(esc_test_stand, 'dshot_idle') \
                         .bind_enabled_from(esc_test_stand, 'is_armed', backward=lambda a: not a)
 

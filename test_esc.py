@@ -175,13 +175,14 @@ class DShotTransmitter:
         self._current_wid: Optional[int] = None
         self._last_throttle: Optional[int] = None
         self._lock = threading.Lock()
-        # POPRAWKA: Użycie RLock zamiast Lock, aby uniknąć zakleszczenia (deadlock)
-        # w metodzie set_throttle(), która wywołuje _process_pending_deletes().
         self._tx_lock = threading.RLock()  # serializacja wave*
         self._pending_delete = deque()  # (wid, safe_after_time)
         self._pending_ids = set()       # deduplikacja WID w kolejce
         self._req_counter = 0
         self._building_wave = False     # flaga stanu budowy fali
+
+        # Logger
+        self._logger = logging.getLogger('DShotTX')
 
         # Timing DShot
         self._tbit_us = 3
@@ -302,12 +303,10 @@ class DShotTransmitter:
 
         # Sprawdź zasoby i ewentualnie posprzątaj stare fale
         try:
-            max_cbs = self.worker.call('wave_get_max_cbs', timeout=1.0)
-            cur_cbs = self.worker.call('wave_get_cbs', timeout=1.0)
-            # Przybliż, ile "fal" zajmują CB (dzielnik ~25 jako heurystyka)
-            max_waves = int(max_cbs) // 25 if isinstance(max_cbs, int) else 0
-            current_waves = int(cur_cbs) // 25 if isinstance(cur_cbs, int) else 0
-            if max_waves > 0 and current_waves > max_waves * 0.8:
+            max_cbs = int(self.worker.call('wave_get_max_cbs', timeout=1.0))
+            cur_cbs = int(self.worker.call('wave_get_cbs', timeout=1.0))
+            if max_cbs > 0 and cur_cbs > max_cbs * 0.8:
+                self._logger.warning(f"Wysokie użycie CB: {cur_cbs}/{max_cbs} (~{100*cur_cbs/max_cbs:.1f}%). Sprzątanie starych fal.")
                 self._cleanup_old_waves()
         except Exception:
             pass
@@ -318,6 +317,7 @@ class DShotTransmitter:
             self._emergency_cleanup()
             wid = self._create_wave_atomic(pulses)
             if not isinstance(wid, int) or wid < 0:
+                self._logger.error(f"pigpio wave_create failed after cleanup: {wid}")
                 raise RuntimeError(f"pigpio wave_create failed after cleanup: {wid}")
         return wid
 
@@ -443,7 +443,7 @@ class DShotTransmitter:
                 wids_to_delete = set(self._pending_ids)
                 if self._current_wid is not None:
                     wids_to_delete.add(self._current_wid)
-                
+
                 self._pending_delete.clear()
                 self._pending_ids.clear()
                 self._current_wid = None
@@ -455,14 +455,6 @@ class DShotTransmitter:
                     self.worker.call('wave_delete', wid, timeout=1.0)
                 except Exception:
                     pass
-            
-            # ULEPSZENIE: Usunięto globalne `wave_clear()`. Metoda teraz kasuje tylko
-            # fale stworzone przez tę instancję, co jest bezpieczniejsze i bardziej
-            # odizolowane.
-            # try:
-            #     self.worker.call('wave_clear', timeout=1.0)
-            # except Exception:
-            #     pass
 
 
 # -------------------- POMOCNICZE --------------------
@@ -496,6 +488,11 @@ class ESCTestStand:
             fh.setLevel(logging.INFO)
             fh.setFormatter(formatter)
             self._logger.addHandler(fh)
+            # Dodatkowo logowanie na konsolę
+            ch = logging.StreamHandler()
+            ch.setLevel(logging.INFO)
+            ch.setFormatter(formatter)
+            self._logger.addHandler(ch)
 
         # Ustawienia testu (globalne)
         self.duration_seconds = DEFAULT_DURATION
@@ -516,7 +513,7 @@ class ESCTestStand:
         self.dshot_bit_us = 3  # 3 µs zalecane (aproksymacja DShot300)
 
         # Protokół i parametry PWM
-        self._protocol = 'PWM490'  # 'PWM50' | 'PWM490' | 'DSHOT300' (UI: "DShot")
+        self._protocol = 'PWM490'  # 'PWM50' | 'PWM490' | 'DSHOT300'
         self._pwm_frequency = PWM_FREQUENCY
         self._pwm_range = PWM_RANGE
         self._pu = 1_000_000 / self._pwm_frequency  # okres w µs dla PWM490
@@ -553,6 +550,7 @@ class ESCTestStand:
 
         # Dodatkowe flagi i stany
         self._reconnect_needed = False
+        self._reconnect_evt = threading.Event()
         self._arm_timer: Optional[threading.Timer] = None
         self._loop_hung = False
         self._send_errors = 0
@@ -568,6 +566,17 @@ class ESCTestStand:
             except Exception as e:
                 self._log_error("pigpio stop during init", e)
             raise IOError("pigpio daemon not running! Uruchom: sudo pigpiod -s 1")
+
+        try:
+            # Logowanie wersji pigpio i HW revision
+            try:
+                ver = self.pi.get_pigpio_version()
+                hw = self.pi.get_hardware_revision()
+                self._logger.info(f"pigpio version: {ver}, HW rev: 0x{hw:X}")
+            except Exception:
+                pass
+        except Exception:
+            pass
 
         # Worker do pigpio
         self._pw = PigpioWorker(self.pi)
@@ -593,18 +602,19 @@ class ESCTestStand:
         # Nadajnik DShot
         self._dshot_tx = DShotTransmitter(self._pw, self.gpio_pin, bit_time_us=self.dshot_bit_us)
 
-        # Jeśli domyślny protokół to DSHOT300, wystartuj od razu transmisję 0
+        # Jeśli domyślny protokół to DSHOT300, wystartuj od razu transmisję idle (>=48), nie 0
         if self._protocol == 'DSHOT300':
             try:
-                self._dshot_tx.set_throttle(0)
+                idle_val = int(max(DSHOT_MIN_THROTTLE, min(DSHOT_MAX_THROTTLE, self.dshot_idle)))
+                self._dshot_tx.set_throttle(idle_val)
             except Exception as e:
-                self._log_error("Initial DShot throttle=0 failed", e)
+                self._log_error("Initial DShot throttle=idle failed", e)
 
         # Wątek sterujący
         self._pwm_thread = threading.Thread(target=self._run_loop, daemon=True, name='esc-run-loop')
         self._pwm_thread.start()
 
-        # Wątek monitorujący reconnect (bez deadlocków)
+        # Wątek monitorujący reconnect (oparty o event)
         self._reconnect_thread = threading.Thread(target=self._reconnect_monitor, daemon=True, name='reconnect-monitor')
         self._reconnect_thread.start()
 
@@ -615,32 +625,12 @@ class ESCTestStand:
     def _log_error(self, context: str, error: Exception):
         self._logger.error(f"{context}: {type(error).__name__}: {str(error)}", exc_info=True)
 
-    def _with_timeout(self, func, timeout=5.0, error_msg="Operation timeout"):
-        """Wykonaj funkcję z globalnym timeout (osobny wątek)."""
-        result = [None]
-        exception = [None]
-
-        def target():
-            try:
-                result[0] = func()
-            except Exception as e:
-                exception[0] = e
-
-        thread = threading.Thread(target=target, daemon=True)
-        thread.start()
-        thread.join(timeout)
-        if thread.is_alive():
-            self._log_error(error_msg, TimeoutError(f"Timeout after {timeout}s"))
-            raise TimeoutError(error_msg)
-        if exception[0]:
-            raise exception[0]
-        return result[0]
-
     def _safe_pigpio_call(self, method: str, *args, **kwargs):
         """Bezpieczne wywołanie metody pigpio z obsługą rozłączenia (bez bezpośredniego reconnect)."""
         if not self.pi.connected:
             with self._lock:
                 self._reconnect_needed = True
+                self._reconnect_evt.set()
             raise ConnectionError("pigpio disconnected")
 
         try:
@@ -648,14 +638,20 @@ class ESCTestStand:
         except ConnectionError:
             with self._lock:
                 self._reconnect_needed = True
+                self._reconnect_evt.set()
             raise
         except Exception as e:
             self._log_error(f"pigpio call failed: {method}", e)
             raise
 
     def _reconnect_monitor(self):
-        """Osobny wątek monitorujący potrzebę reconnect."""
+        """Wątek monitorujący potrzebę reconnect (event-driven)."""
         while not self._stop_event.is_set():
+            # Czekaj na sygnał reconnect lub timeout kontrolny
+            self._reconnect_evt.wait(timeout=5.0)
+            self._reconnect_evt.clear()
+            if self._stop_event.is_set():
+                break
             need_reconnect = False
             with self._lock:
                 need_reconnect = self._reconnect_needed
@@ -665,7 +661,6 @@ class ESCTestStand:
                 finally:
                     with self._lock:
                         self._reconnect_needed = False
-            time.sleep(0.5)
 
     def _handle_pigpio_disconnected(self):
         """Obsłuż rozłączenie z pigpio: awaryjny stop, notyfikacja i sygnalizacja reconnect."""
@@ -676,6 +671,7 @@ class ESCTestStand:
             self._running_event.clear()
             self._finishing = False
             self._reconnect_needed = True  # sygnalizuj reconnect monitorowi
+            self._reconnect_evt.set()
 
         if was_armed:
             self._notify_bg("PIGPIO DISCONNECTED - EMERGENCY STOP", 'negative')
@@ -716,9 +712,10 @@ class ESCTestStand:
                         self._safe_pigpio_call('set_servo_pulsewidth', self.gpio_pin, 0, timeout=1.0)
                     elif self._protocol == 'DSHOT300':
                         try:
-                            self._dshot_tx.set_throttle(0)
+                            idle_val = int(max(DSHOT_MIN_THROTTLE, min(DSHOT_MAX_THROTTLE, self.dshot_idle)))
+                            self._dshot_tx.set_throttle(idle_val)
                         except Exception as e:
-                            self._log_error("DShot set_throttle(0) after reconnect", e)
+                            self._log_error("DShot set_throttle(idle) after reconnect", e)
                 except Exception as e:
                     self._log_error("GPIO reconfiguration after reconnect", e)
 
@@ -769,6 +766,7 @@ class ESCTestStand:
         self._notify_bg(f"pigpio error: {e}", 'negative')
         with self._lock:
             self._reconnect_needed = True  # sygnalizuj reconnect
+            self._reconnect_evt.set()
         try:
             self.disarm_system()
         except Exception as ex:
@@ -777,6 +775,7 @@ class ESCTestStand:
     def cleanup(self):
         self._stop_event.set()
         self._wake_event.set()
+        self._reconnect_evt.set()
         self._pwm_thread.join(timeout=2.0)
         if self._pwm_thread.is_alive():
             print("Warning: PWM thread did not terminate properly")
@@ -819,7 +818,6 @@ class ESCTestStand:
         # Zatrzymaj wątek reconnect monitora
         try:
             if hasattr(self, '_reconnect_thread') and self._reconnect_thread.is_alive():
-                # monitor zakończy się po _stop_event
                 self._reconnect_thread.join(timeout=2.0)
         except Exception:
             pass
@@ -878,12 +876,13 @@ class ESCTestStand:
                     pass
                 self._protocol = 'DSHOT300'
                 self._notify_bg("Protokół: DShot (bit=3–4µs; wymaga pigpiod -s 1)", 'info')
-                # WAŻNE: od razu start transmisji z 0
+                # WAŻNE: od razu start transmisji z idle (>=48), nie 0
                 try:
                     self._dshot_tx.set_bit_time_us(self.dshot_bit_us)
-                    self._dshot_tx.set_throttle(0)
+                    idle_val = int(max(DSHOT_MIN_THROTTLE, min(DSHOT_MAX_THROTTLE, self.dshot_idle)))
+                    self._dshot_tx.set_throttle(idle_val)
                 except Exception as e:
-                    self._log_error("DShot set_throttle(0) on set_protocol", e)
+                    self._log_error("DShot set_throttle(idle) on set_protocol", e)
                 self._log_info("Protocol changed to DSHOT")
 
             elif protocol == 'PWM50':
@@ -1080,9 +1079,7 @@ class ESCTestStand:
                     else:
                         # DISARMED
                         if proto == 'DSHOT300':
-                            # ULEPSZENIE: Uproszczona logika. Transmisja jest zatrzymywana
-                            # jawnie w disarm_system(). Tutaj po prostu nie generujemy
-                            # nowego sygnału (out=None).
+                            # Transmisja jest zatrzymywana jawnie w disarm_system()
                             out = None
                         elif proto == 'PWM50':
                             out = ('SERVO', 0)
@@ -1097,7 +1094,9 @@ class ESCTestStand:
                             raise ConnectionError("pigpio disconnected")
                         current_proto = self._protocol
                         if out[0] == 'DSHOT' and current_proto == 'DSHOT300':
-                            self._dshot_tx.set_throttle(out[1])
+                            # Upewnij się, że nigdy nie wyślemy < 48
+                            safe_val = max(DSHOT_MIN_THROTTLE, min(DSHOT_MAX_THROTTLE, int(out[1])))
+                            self._dshot_tx.set_throttle(safe_val)
                         elif out[0] == 'SERVO' and current_proto == 'PWM50':
                             self._safe_pigpio_call('set_servo_pulsewidth', self.gpio_pin, int(out[1]), retries=3, timeout=1.0)
                         elif out[0] == 'PWM' and current_proto == 'PWM490':
@@ -1146,9 +1145,9 @@ class ESCTestStand:
             self._time_left_snapshot = float(self.duration_seconds)
 
             if self._protocol == 'DSHOT300':
-                # start od 0 (krótko), potem idle
-                self._current_dshot = 0.0
-                self._target_dshot = 0.0
+                idle_val = float(max(DSHOT_MIN_THROTTLE, min(DSHOT_MAX_THROTTLE, self.dshot_idle)))
+                self._current_dshot = idle_val
+                self._target_dshot = idle_val
             else:
                 self._current_pwm = float(self.idle_pwm)
                 self._target_pwm = float(self.idle_pwm)
@@ -1156,20 +1155,17 @@ class ESCTestStand:
 
         try:
             if self._protocol == 'DSHOT300':
-                # Wyślij 0 teraz, po 200ms przejdź na idle
-                self._dshot_tx.set_throttle(0)
+                # Od razu wyślij idle (>=48), ewentualnie po chwili powtórz
+                idle_val = int(max(DSHOT_MIN_THROTTLE, min(DSHOT_MAX_THROTTLE, self.dshot_idle)))
+                self._dshot_tx.set_throttle(idle_val)
 
                 def set_idle():
                     with self._lock:
                         if self._armed and self._protocol == 'DSHOT300' and not self._stop_event.is_set():
-                            idle_val = int(max(DSHOT_MIN_THROTTLE, min(DSHOT_MAX_THROTTLE, self.dshot_idle)))
-                            self._current_dshot = float(idle_val)
-                            self._target_dshot = float(idle_val)
                             try:
                                 self._dshot_tx.set_throttle(idle_val)
                             except Exception as e:
                                 self._log_error("DShot set_idle after arm", e)
-                        # Wyczyść referencję
                         self._arm_timer = None
 
                 self._arm_timer = threading.Timer(0.2, set_idle)
@@ -1590,7 +1586,7 @@ def create_settings_section():
     with ui.card().classes('w-full max-w-2xl mx-auto q-mt-md'):
         ui.label('SETTINGS').classes('text-h5')
 
-        # ULEPSZENIE: Dodano funkcje walidujące dla wartości IDLE.
+        # Walidacje
         def ensure_pwm_idle(val):
             try:
                 v = int(val)

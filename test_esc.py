@@ -2,6 +2,7 @@ import time
 import random
 import threading
 import logging
+from logging.handlers import RotatingFileHandler
 import queue
 from collections import deque
 from typing import Optional, Any
@@ -141,6 +142,18 @@ class PigpioWorker:
         self._stop_event.set()
         self._q.put(None)
         self._thread.join(timeout=2.0)
+        # Best-effort opróżnienie kolejki (po zatrzymaniu)
+        try:
+            while True:
+                item = self._q.get_nowait()
+                if isinstance(item, tuple) and len(item) == 6:
+                    *_, fut = item
+                    try:
+                        fut.cancel()
+                    except Exception:
+                        pass
+        except queue.Empty:
+            pass
 
     @property
     def connected(self) -> bool:
@@ -358,7 +371,7 @@ class DShotTransmitter:
                 req_id = self._req_counter
                 prev_wid = self._current_wid
                 self._last_throttle = throttle
-                self._building_wave = True  # rozpoczynamy budowanie nowej fali
+                self._building_wave = True  # rozpoczynamy budowę nowej fali
 
             new_wid = None
             try:
@@ -390,7 +403,7 @@ class DShotTransmitter:
                         oldest_wid, safe_time = self._pending_delete[0]
                         tx_at = self._get_tx_at()
                         if (safe_time <= now) and (oldest_wid != tx_at) and (oldest_wid != self._current_wid):
-                            self._pending_delete.popLeft()
+                            self._pending_delete.popleft()  # FIX: poprawiona literówka
                             self._pending_ids.discard(oldest_wid)
                             try:
                                 self.worker.call('wave_delete', oldest_wid, timeout=0.2)
@@ -471,9 +484,9 @@ class ESCTestStand:
         self._logger = logging.getLogger('ESCTestStand')
         self._logger.setLevel(logging.INFO)
         if not self._logger.handlers:
-            fh = logging.FileHandler('esc_test.log')
-            fh.setLevel(logging.INFO)
             formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+            fh = RotatingFileHandler('esc_test.log', maxBytes=1_000_000, backupCount=3)
+            fh.setLevel(logging.INFO)
             fh.setFormatter(formatter)
             self._logger.addHandler(fh)
 
@@ -702,6 +715,10 @@ class ESCTestStand:
                             self._log_error("DShot set_throttle(0) after reconnect", e)
                 except Exception as e:
                     self._log_error("GPIO reconfiguration after reconnect", e)
+
+                # Reset liczników błędów po reconnect
+                with self._lock:
+                    self._send_errors = 0
 
                 self._notify_bg("Reconnected to pigpio", 'positive')
                 self._log_info("Reconnected to pigpio")
@@ -974,6 +991,9 @@ class ESCTestStand:
                         close_enough = (abs((self._current_dshot if proto == 'DSHOT300' else self._current_pwm) - target) < 1.0)
                         timeout_reached = (now >= self._finishing_deadline_mono) if self._finishing_deadline_mono > 0 else False
                         if close_enough or timeout_reached:
+                            # Powiadom jeśli timeout zadziałał
+                            if timeout_reached and (not close_enough):
+                                self._notify_bg("Finishing timeout: wymuszono idle", 'warning')
                             self._finishing = False
                             self._auto_finish = False
                             self._stopping_soft = False
@@ -1196,13 +1216,17 @@ class ESCTestStand:
             self._progress_snapshot = 0.0
             self._elapsed_snapshot = 0.0
             self._time_left_snapshot = float(self.duration_seconds)
+            # Upewnij się, że nie będziemy próbować drugi raz stopować w run_loop
+            self._dshot_stopped_on_disarm = True
 
         try:
             if self._protocol == 'DSHOT300':
                 try:
-                    self._dshot_tx.set_throttle(0)
+                    # Twarde zatrzymanie DShot przy DISARM
+                    self._dshot_tx.stop()
+                    self._safe_pigpio_call('write', self.gpio_pin, 0, timeout=1.0)
                 except Exception as e:
-                    self._log_error("DShot set_throttle(0) on disarm", e)
+                    self._log_error("DShot stop on disarm", e)
             elif self._protocol == 'PWM50':
                 try:
                     self._safe_pigpio_call('set_servo_pulsewidth', self.gpio_pin, 0, timeout=1.0)
@@ -1296,7 +1320,15 @@ class ESCTestStand:
         if hard:
             try:
                 if proto == 'DSHOT300':
-                    self._dshot_tx.set_throttle(0)
+                    # Twarde zatrzymanie DShot: stop fale + niski stan na pinie
+                    try:
+                        self._dshot_tx.stop()
+                    except Exception as e:
+                        self._log_error("DShot hard stop: tx.stop()", e)
+                    try:
+                        self._safe_pigpio_call('write', self.gpio_pin, 0, timeout=1.0)
+                    except Exception as e:
+                        self._log_error("DShot hard stop: write(0)", e)
                 elif proto == 'PWM50':
                     try:
                         self._safe_pigpio_call('set_servo_pulsewidth', self.gpio_pin, 0, timeout=1.0)
@@ -1460,6 +1492,10 @@ def create_controls_section():
             heartbeat_state['beat'] = (heartbeat_state['beat'] + 1) % 2
             if hasattr(esc_test_stand, '_last_update_mono'):
                 age = time.monotonic() - esc_test_stand._last_update_mono
+                # Usuń poprzednie klasy koloru
+                heartbeat_icon.classes(remove='text-negative text-warning text-positive')
+                status_label.classes(remove='text-negative text-warning text-positive')
+
                 # Ocena kondycji pętli
                 if getattr(esc_test_stand, '_loop_hung', False) or age > 2.0:
                     heartbeat_icon.classes('text-negative')

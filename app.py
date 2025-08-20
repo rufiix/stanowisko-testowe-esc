@@ -45,7 +45,6 @@ def create_controls_section():
 
         time_label = ui.label().classes('text-lg')
 
-        # Pasek postępu z napisem wewnątrz (absolute-center działa tylko dla dzieci)
         prog = ui.linear_progress(show_value=False) \
             .style('height:35px;border-radius:8px;position:relative;') \
             .props('instant-feedback')
